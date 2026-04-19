@@ -1,0 +1,132 @@
+<!doctype html>
+<html lang="zh-CN">
+  <head>
+    <meta charset="utf-8" />
+    <title>星空标注 Demo</title>
+  </head>
+  <body>
+    <h1>星空照片识别 Demo</h1>
+    <p>上传一张星空照片，系统会做 plate solving，然后叠加星座线、深空目标和可识别星名。你可以按层开关并调节详细度。</p>
+
+    <h2>叠加设置</h2>
+    <form id="options-form">
+      <p>
+        <label>
+          详细度预设
+          <select id="preset">
+            <option value="balanced">平衡</option>
+            <option value="detailed">详细</option>
+            <option value="max">最大信息量</option>
+          </select>
+        </label>
+      </p>
+
+      <fieldset>
+        <legend>图层开关</legend>
+        <label><input type="checkbox" id="layer-constellation-lines" /> 星座连线</label><br />
+        <label><input type="checkbox" id="layer-constellation-labels" /> 星座名称</label><br />
+        <label><input type="checkbox" id="layer-contextual-constellation-labels" /> 补充星座名称</label><br />
+        <label><input type="checkbox" id="layer-star-markers" /> 恒星标记点</label><br />
+        <label><input type="checkbox" id="layer-star-labels" /> 恒星名称</label><br />
+        <label><input type="checkbox" id="layer-deep-sky-markers" /> 深空目标符号</label><br />
+        <label><input type="checkbox" id="layer-deep-sky-labels" /> 深空目标标签</label><br />
+        <label><input type="checkbox" id="layer-label-leaders" /> 引导线</label>
+      </fieldset>
+
+      <fieldset>
+        <legend>详细度参数</legend>
+        <p>
+          <label>
+            恒星标签上限
+            <input type="number" id="star-label-limit" min="0" max="80" step="1" />
+          </label>
+        </p>
+        <p>
+          <label>
+            恒星最暗星等
+            <input type="number" id="star-magnitude-limit" min="0" max="8" step="0.1" />
+          </label>
+        </p>
+        <p>
+          <label>
+            亮星最小间距
+            <input type="number" id="star-bright-separation" min="20" max="180" step="1" />
+          </label>
+        </p>
+        <p>
+          <label>
+            暗星最小间距
+            <input type="number" id="star-dim-separation" min="12" max="150" step="1" />
+          </label>
+        </p>
+        <p>
+          <label>
+            深空目标标签上限
+            <input type="number" id="dso-label-limit" min="0" max="120" step="1" />
+          </label>
+        </p>
+        <p>
+          <label>
+            深空目标最暗星等
+            <input type="number" id="dso-magnitude-limit" min="0" max="20" step="0.1" />
+          </label>
+        </p>
+        <p>
+          <label>
+            深空目标防重叠系数
+            <input type="number" id="dso-spacing-scale" min="0.1" max="1.5" step="0.01" />
+          </label>
+        </p>
+        <p>
+          <label><input type="checkbox" id="show-all-constellation-labels" /> 尽量显示全部星座名称</label><br />
+          <label><input type="checkbox" id="detailed-dso-labels" /> 深空目标显示编号 + 名称</label><br />
+          <label><input type="checkbox" id="include-catalog-dsos" /> 包含通用 NGC / IC 目录目标</label>
+        </p>
+      </fieldset>
+    </form>
+
+    <h2>上传图片</h2>
+    <form id="upload-form">
+      <input type="file" id="image" name="image" accept="image/*" required />
+      <label>
+        请求渲染模式
+        <select id="request-render-mode" name="render_mode">
+          <option value="server">服务端合成图片 + JSON</option>
+          <option value="client">只返回 JSON，前端绘制</option>
+        </select>
+      </label>
+      <label>
+        标签语言
+        <select id="request-locale" name="locale"></select>
+      </label>
+      <button type="submit">开始识别</button>
+    </form>
+
+    <h2>样例图片</h2>
+    <div id="samples"></div>
+
+    <h2>状态</h2>
+    <pre id="status">等待上传</pre>
+
+    <h2>结果视图</h2>
+    <p>
+      <label>
+        查看模式
+        <select id="viewer-mode">
+          <option value="auto">自动</option>
+          <option value="server">服务端合成图</option>
+          <option value="client">前端绘制层</option>
+        </select>
+      </label>
+    </p>
+    <div id="viewer">
+      <img id="result-image" alt="标注结果图片" />
+      <canvas id="result-canvas" aria-label="前端绘制结果"></canvas>
+    </div>
+
+    <h2>结果数据</h2>
+    <pre id="result-json"></pre>
+
+    <script type="module" src="/app.js"></script>
+  </body>
+</html>

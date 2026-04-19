@@ -1,0 +1,19 @@
+{
+  "name": "star-annotator-demo",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "bootstrap": "bun run src/bootstrap-data.ts",
+    "dev": "bun run src/bootstrap-data.ts && bun run src/server.ts",
+    "start": "bun run src/server.ts",
+    "typecheck": "bun x tsc --noEmit",
+    "test": "bun test",
+    "check": "bun run typecheck && bun run test",
+    "sample:apod4": "bun run src/run-sample.ts apod4",
+    "sample:apod5": "bun run src/run-sample.ts apod5",
+    "sample:orion": "bun run src/run-sample.ts orion-over-pines"
+  },
+  "devDependencies": {
+    "@types/bun": "latest"
+  }
+}

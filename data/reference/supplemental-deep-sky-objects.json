@@ -1,0 +1,17 @@
+[
+  {
+    "name": "Melotte25",
+    "catalog_id": "Mel25",
+    "type": "OCl",
+    "const": "Tau",
+    "ra": "04:27:00",
+    "dec": "+15:52:00",
+    "major_axis_arcmin": 330.0,
+    "magnitude": 0.5,
+    "label_key": "hyades",
+    "common_names": [
+      "Hyades"
+    ],
+    "messier": null
+  }
+]

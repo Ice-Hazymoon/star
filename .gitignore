@@ -1,0 +1,12 @@
+.venv/
+node_modules/
+vendor/
+data/astrometry/
+inputs/
+outputs/
+tmp/
+__pycache__/
+python/__pycache__/
+*.pyc
+*.pyo
+.DS_Store

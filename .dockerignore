@@ -1,0 +1,10 @@
+.git
+.venv
+node_modules
+inputs
+outputs
+tmp
+test
+vendor
+*.pyc
+__pycache__

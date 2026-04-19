@@ -1,0 +1,7 @@
+astroquery
+astropy
+pandas
+pillow
+requests
+skyfield
+sep
