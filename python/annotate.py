@@ -35,6 +35,16 @@ except ImportError:  # pragma: no cover - optional dependency for source extract
 
 warnings.filterwarnings("ignore", category=FITSFixedWarning)
 
+# Resource caps against adversarial inputs. A malicious image with tens of
+# thousands of tiny blobs can make sep.extract burn minutes of CPU; a
+# decompression-bomb PNG can allocate hundreds of MB of luma before we even
+# reach source extraction. These bounds keep the worker's worst case roughly
+# linear with the legitimate use case and let obvious attacks fail fast.
+MAX_INPUT_IMAGE_PIXELS = 50_000_000
+MAX_INPUT_IMAGE_DIMENSION = 10_000
+MAX_DETECTED_SOURCES = 8_000
+Image.MAX_IMAGE_PIXELS = MAX_INPUT_IMAGE_PIXELS
+
 RESOURCE_KEY_PREFIXES = ("the_", "great_")
 RESOURCE_KEY_SUFFIXES = (
     "_globular_cluster",
@@ -1137,9 +1147,22 @@ def load_deep_sky_objects(
     return list(merged.values())
 
 
+def _reject_oversize_image(width: int, height: int) -> None:
+    if width > MAX_INPUT_IMAGE_DIMENSION or height > MAX_INPUT_IMAGE_DIMENSION:
+        raise RuntimeError(
+            f"image {width}x{height} exceeds dimension cap of {MAX_INPUT_IMAGE_DIMENSION}px per side",
+        )
+    if width * height > MAX_INPUT_IMAGE_PIXELS:
+        raise RuntimeError(
+            f"image area {width * height} exceeds pixel cap of {MAX_INPUT_IMAGE_PIXELS}",
+        )
+
+
 def normalize_image(input_path: Path, workdir: Path) -> tuple[Image.Image, Path]:
     with Image.open(input_path) as image:
+        _reject_oversize_image(image.width, image.height)
         normalized = ImageOps.exif_transpose(image).convert("RGB")
+    _reject_oversize_image(normalized.width, normalized.height)
     normalized_path = workdir / "normalized-input.jpg"
     normalized.save(normalized_path, quality=95)
     return normalized, normalized_path
@@ -1210,7 +1233,24 @@ def analyze_sources(image: Image.Image) -> SourceAnalysis:
     background = sep.Background(luma)
     data = np.ascontiguousarray(luma - background.back(), dtype=np.float32)
     threshold = max(float(background.globalrms) * 2.2, 4.0)
-    objects = sep.extract(data, thresh=threshold, err=background.globalrms, minarea=3)
+    # deblend_nthresh=16 / deblend_cont=0.01 keep enough deblending for dense
+    # clusters while making hostile dot-storm images roughly 2x cheaper to
+    # process than the sep defaults.
+    objects = sep.extract(
+        data,
+        thresh=threshold,
+        err=background.globalrms,
+        minarea=3,
+        deblend_nthresh=16,
+        deblend_cont=0.01,
+    )
+
+    # On adversarial inputs sep.extract can return tens of thousands of blobs.
+    # We only feed up to ~900 into solve-field anyway, so truncate by flux
+    # here before the O(n) Python loop below.
+    if len(objects) > MAX_DETECTED_SOURCES:
+        flux_order = np.argsort(np.asarray(objects["flux"], dtype=np.float64))[::-1]
+        objects = objects[flux_order[:MAX_DETECTED_SOURCES]]
 
     raw_detections: list[SourceDetection] = []
     usable_detections: list[SourceDetection] = []
