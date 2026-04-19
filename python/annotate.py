@@ -1998,7 +1998,12 @@ def crop_bounds(crop: CropCandidate, margin: float = 0.0) -> tuple[float, float,
 
 
 def project_points(wcs: WCS, ra_values: np.ndarray, dec_values: np.ndarray, crop: CropCandidate) -> tuple[np.ndarray, np.ndarray]:
-    x_values, y_values = wcs.wcs_world2pix(ra_values, dec_values, 0)
+    if len(ra_values) == 0:
+        return np.asarray(ra_values, dtype=np.float64), np.asarray(dec_values, dtype=np.float64)
+    # all_world2pix applies the SIP / distortion polynomial that solve-field writes
+    # by default; wcs_world2pix would only do the linear TAN step and miss tens of
+    # pixels of correction near the edge of wide-angle frames.
+    x_values, y_values = wcs.all_world2pix(ra_values, dec_values, 0, quiet=True)
     return x_values + crop.x, y_values + crop.y
 
 
