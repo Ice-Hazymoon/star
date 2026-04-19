@@ -333,14 +333,14 @@ function rejectPendingRequest(requestId: string, reason: unknown) {
 
 function destroyWorker(reason: string) {
   if (!workerProcess) {
-    workerReady = false;
+    workerReady = !CONFIG.preloadWorkerOnStartup;
     return;
   }
 
   logError("restarting annotation worker", reason);
   const processToStop = workerProcess;
   workerProcess = null;
-  workerReady = false;
+  workerReady = !CONFIG.preloadWorkerOnStartup;
 
   try {
     processToStop.kill();
@@ -411,7 +411,7 @@ function ensureAnnotationWorker() {
   void spawnedWorker.exited.then(() => {
     if (workerProcess === spawnedWorker) {
       workerProcess = null;
-      workerReady = false;
+      workerReady = !CONFIG.preloadWorkerOnStartup;
     }
     const failure = new Error("annotation worker exited unexpectedly");
     for (const [requestId, pending] of pendingWorkerRequests.entries()) {
@@ -856,6 +856,7 @@ async function handleAnalyzeSample(request: Request) {
     const overlayOptions = normalizeOverlayOptions(body?.options ?? undefined);
     const renderMode = normalizeRenderMode(body?.render_mode);
     const locale = normalizeLocaleTag(body?.locale) || parsePrimaryAcceptLanguage(request.headers.get("accept-language")) || "en";
+    logInfo("sample accepted", { requestId, sampleId: sample.id, renderMode, locale });
     const result = await withTemporaryDirectory(
       `star-sample-${sample.id}-`,
       (workspaceDir) => withJobSlot(() => runAnnotation(path.join(SAMPLES_DIR, sample.filename), {
@@ -866,6 +867,7 @@ async function handleAnalyzeSample(request: Request) {
         abortSignal: request.signal,
       })),
     );
+    logInfo("sample completed", { requestId, sampleId: sample.id, processingMs: result.processingMs });
     return finalizeResponse(request, jsonResponse(result), requestId);
   } catch (error) {
     logError("sample analyze failed", error, { requestId, sampleId: sample.id });
@@ -884,7 +886,7 @@ function serveStaticFile(request: Request, baseDir: string, relativePath: string
     return finalizeResponse(request, new Response("Not Found", { status: 404 }), undefined, "no-store");
   }
 
-  if (!existsSync(absolutePath)) {
+  if (!existsSync(absolutePath) || !statSync(absolutePath).isFile()) {
     return finalizeResponse(request, new Response("Not Found", { status: 404 }), undefined, "no-store");
   }
 

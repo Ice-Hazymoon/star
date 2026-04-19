@@ -22,6 +22,15 @@ describe("overlay options", () => {
     expect(options.detail.include_catalog_dsos).toBe(false);
   });
 
+  test("invalid preset name does not leak into the result", () => {
+    const options = normalizeOverlayOptions({
+      preset: "minimal",
+    });
+
+    expect(options.preset).toBe("max");
+    expect(options.detail.include_catalog_dsos).toBe(true);
+  });
+
   test("numeric values are clamped", () => {
     const options = normalizeOverlayOptions({
       detail: {

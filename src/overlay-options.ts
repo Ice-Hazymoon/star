@@ -143,7 +143,8 @@ export function normalizeOverlayOptions(input: unknown): OverlayOptions {
     options as unknown as Record<string, unknown>,
     structuredClone(OVERLAY_PRESETS[preset]) as Record<string, unknown>,
   );
-  deepMerge(options as unknown as Record<string, unknown>, payload as unknown as Record<string, unknown>);
+  const { preset: _ignoredPreset, ...payloadWithoutPreset } = payload;
+  deepMerge(options as unknown as Record<string, unknown>, payloadWithoutPreset as Record<string, unknown>);
 
   options.detail.star_label_limit = Math.round(clampNumber(options.detail.star_label_limit, 36, 0, 80));
   options.detail.star_magnitude_limit = clampNumber(options.detail.star_magnitude_limit, 4.8, 0, 8);

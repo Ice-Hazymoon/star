@@ -264,7 +264,8 @@ def parse_overlay_options(raw_options: str) -> dict[str, Any]:
     preset = OVERLAY_PRESETS.get(preset_name, OVERLAY_PRESETS[options["preset"]])
     options["preset"] = preset_name if preset_name in OVERLAY_PRESETS else options["preset"]
     merge_nested_dict(options, deepcopy(preset))
-    merge_nested_dict(options, payload)
+    payload_without_preset = {key: value for key, value in payload.items() if key != "preset"}
+    merge_nested_dict(options, payload_without_preset)
 
     detail = options["detail"]
     detail["star_label_limit"] = coerce_int(detail.get("star_label_limit"), 36, 0, 80)

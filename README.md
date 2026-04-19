@@ -143,6 +143,8 @@ On startup the server will:
 
 ## Docker
 
+The Docker image bundles whatever is in `data/` at build time and does not download anything itself. Run `bun run bootstrap` on the host first so the index files, catalogs, and samples exist before you build, otherwise the container will fail at startup with a missing-prerequisite error.
+
 Build:
 
 ```bash
@@ -276,8 +278,8 @@ Returns the default overlay configuration, presets, and bundled locale list.
     }
   },
   "presets": {
-    "minimal": {},
     "balanced": {},
+    "detailed": {},
     "max": {}
   },
   "localization": {
@@ -431,7 +433,7 @@ The TypeScript source of truth for the response contract lives in [src/api-types
 
 | Field | Type | Description |
 | --- | --- | --- |
-| `preset` | `string` | `minimal`, `balanced`, or `max` |
+| `preset` | `string` | `balanced`, `detailed`, or `max` |
 | `layers.constellation_lines` | `boolean` | Show constellation line segments |
 | `layers.constellation_labels` | `boolean` | Show constellation labels |
 | `layers.contextual_constellation_labels` | `boolean` | Show more contextual constellation labels |

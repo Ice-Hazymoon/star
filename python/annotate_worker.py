@@ -116,16 +116,19 @@ def main() -> None:
         text = line.strip()
         if not text:
             continue
+        request_id: str | None = None
         try:
             payload = json.loads(text)
+            if isinstance(payload, dict):
+                request_id = payload.get("id")
             response = {
-                "id": payload["id"],
+                "id": request_id,
                 "ok": True,
                 "result": process_job(payload),
             }
         except Exception as exc:  # pragma: no cover - worker protocol
             response = {
-                "id": payload["id"] if isinstance(locals().get("payload"), dict) and "id" in payload else None,
+                "id": request_id,
                 "ok": False,
                 "error": str(exc),
             }
