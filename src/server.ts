@@ -913,6 +913,7 @@ export async function startServer() {
   await warmAnnotationWorker();
 
   const server = Bun.serve({
+    hostname: "0.0.0.0",
     port: CONFIG.port,
     idleTimeout: CONFIG.idleTimeoutSeconds,
     maxRequestBodySize: CONFIG.maxRequestBodySizeBytes,

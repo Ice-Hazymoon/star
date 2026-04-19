@@ -1,3 +1,75 @@
+FROM oven/bun:debian AS python-deps
+
+USER root
+WORKDIR /app
+
+ENV DEBIAN_FRONTEND=noninteractive \
+    PIP_CONFIG_FILE=/dev/null \
+    PIP_DISABLE_PIP_VERSION_CHECK=1 \
+    PYTHONDONTWRITEBYTECODE=1 \
+    PYTHONUNBUFFERED=1 \
+    HTTP_PROXY= \
+    HTTPS_PROXY= \
+    ALL_PROXY= \
+    http_proxy= \
+    https_proxy= \
+    all_proxy= \
+    NO_PROXY= \
+    no_proxy=
+
+RUN export http_proxy= HTTPS_PROXY= HTTP_PROXY= https_proxy= ALL_PROXY= all_proxy= NO_PROXY= no_proxy= \
+    && apt-get -o Acquire::http::Proxy=false -o Acquire::https::Proxy=false update \
+    && apt-get -o Acquire::http::Proxy=false -o Acquire::https::Proxy=false install -y --no-install-recommends \
+    ca-certificates \
+    python3 \
+    python3-pip \
+    python3-venv \
+    && rm -rf /var/lib/apt/lists/*
+
+RUN python3 -m venv /app/.venv
+ENV PATH="/app/.venv/bin:${PATH}"
+
+COPY requirements.txt ./
+RUN export http_proxy= HTTPS_PROXY= HTTP_PROXY= https_proxy= ALL_PROXY= all_proxy= NO_PROXY= no_proxy= \
+    && pip install --proxy "" --no-cache-dir -r requirements.txt \
+    && find /app/.venv -name '*.pyc' -delete \
+    && find /app/.venv -name '__pycache__' -type d -prune -exec rm -rf '{}' +
+
+FROM oven/bun:debian AS data-bootstrap
+
+USER root
+WORKDIR /app
+
+ENV DEBIAN_FRONTEND=noninteractive \
+    HTTP_PROXY= \
+    HTTPS_PROXY= \
+    ALL_PROXY= \
+    http_proxy= \
+    https_proxy= \
+    all_proxy= \
+    NO_PROXY= \
+    no_proxy=
+
+RUN export http_proxy= HTTPS_PROXY= HTTP_PROXY= https_proxy= ALL_PROXY= all_proxy= NO_PROXY= no_proxy= \
+    && apt-get -o Acquire::http::Proxy=false -o Acquire::https::Proxy=false update \
+    && apt-get -o Acquire::http::Proxy=false -o Acquire::https::Proxy=false install -y --no-install-recommends \
+    ca-certificates \
+    curl \
+    && rm -rf /var/lib/apt/lists/*
+
+COPY data/catalog ./data/catalog
+COPY data/reference ./data/reference
+COPY samples ./samples
+
+RUN export http_proxy= HTTPS_PROXY= HTTP_PROXY= https_proxy= ALL_PROXY= all_proxy= NO_PROXY= no_proxy= \
+    && mkdir -p /app/data/astrometry \
+    && for index in 4107 4108 4109 4110 4111 4112 4113 4114 4115 4116 4117 4118 4119; do \
+        echo "download index-${index}.fits"; \
+        curl -fsSL --retry 3 --retry-delay 2 \
+          "http://data.astrometry.net/4100/index-${index}.fits" \
+          --output "/app/data/astrometry/index-${index}.fits"; \
+      done
+
 FROM oven/bun:debian
 
 USER root
@@ -5,7 +77,7 @@ WORKDIR /app
 
 ENV DEBIAN_FRONTEND=noninteractive \
     NODE_ENV=production \
-    PIP_CONFIG_FILE=/dev/null \
+    PYTHONDONTWRITEBYTECODE=1 \
     PYTHONUNBUFFERED=1 \
     HTTP_PROXY= \
     HTTPS_PROXY= \
@@ -22,23 +94,21 @@ RUN export http_proxy= HTTPS_PROXY= HTTP_PROXY= https_proxy= ALL_PROXY= all_prox
     && apt-get -o Acquire::http::Proxy=false -o Acquire::https::Proxy=false install -y --no-install-recommends \
     astrometry.net \
     ca-certificates \
-    curl \
     python3 \
-    python3-venv \
-    python3-pip \
     && rm -rf /var/lib/apt/lists/*
 
-RUN python3 -m venv /app/.venv
+COPY --from=python-deps /app/.venv /app/.venv
 ENV PATH="/app/.venv/bin:${PATH}"
 
-COPY requirements.txt ./
-RUN export http_proxy= HTTPS_PROXY= HTTP_PROXY= https_proxy= ALL_PROXY= all_proxy= NO_PROXY= no_proxy= \
-    && pip install --proxy "" --no-cache-dir -r requirements.txt
+COPY --from=data-bootstrap --chown=bun:bun /app/data /app/data
+COPY --from=data-bootstrap --chown=bun:bun /app/samples /app/samples
 
-COPY --chown=bun:bun . .
+COPY --chown=bun:bun package.json bun.lock docker-entrypoint.sh ./
+COPY --chown=bun:bun public ./public
+COPY --chown=bun:bun python ./python
+COPY --chown=bun:bun src ./src
 
-RUN chmod +x /app/docker-entrypoint.sh \
-    && chown -R bun:bun /app
+RUN chmod +x /app/docker-entrypoint.sh
 
 USER bun
 
@@ -47,6 +117,6 @@ EXPOSE 3000
 ENTRYPOINT ["/app/docker-entrypoint.sh"]
 
 HEALTHCHECK --interval=30s --timeout=5s --start-period=30s --retries=3 \
-  CMD curl -fsS "http://127.0.0.1:${PORT}/readyz" || exit 1
+  CMD ["env", "-u", "HTTP_PROXY", "-u", "HTTPS_PROXY", "-u", "http_proxy", "-u", "https_proxy", "-u", "ALL_PROXY", "-u", "all_proxy", "-u", "NO_PROXY", "-u", "no_proxy", "python3", "-c", "import os, sys, urllib.request; port = os.environ.get('PORT', '3000'); response = urllib.request.urlopen(f'http://127.0.0.1:{port}/readyz', timeout=4); sys.exit(0 if 200 <= response.status < 400 else 1)"]
 
 CMD ["bun", "run", "start"]

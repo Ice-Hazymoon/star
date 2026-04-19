@@ -143,7 +143,7 @@ On startup the server will:
 
 ## Docker
 
-The Docker image bundles whatever is in `data/` at build time and does not download anything itself. Run `bun run bootstrap` on the host first so the index files, catalogs, and samples exist before you build, otherwise the container will fail at startup with a missing-prerequisite error.
+The Docker build bootstraps missing astrometry indexes during image creation, so a fresh server can build from the repository without pre-populating `data/astrometry`. The first build requires network access and will take noticeably longer while it downloads the `4107-4119` index set.
 
 Build:
 
