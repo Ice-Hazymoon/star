@@ -34,6 +34,12 @@ from annotate_scene import (
     collect_deep_sky_objects,
     collect_named_stars,
 )
+from annotate_sky_mask import (
+    compute_sky_mask,
+    filter_constellations as filter_constellations_by_sky_mask,
+    filter_deep_sky_objects as filter_dsos_by_sky_mask,
+    filter_named_stars as filter_named_stars_by_sky_mask,
+)
 from annotate_solving import solve_image, summarize_solver_output
 from annotate_types import LocalizationBundle
 
@@ -118,6 +124,20 @@ def annotate_image(
             )
             scene_ms = (time.perf_counter() - scene_start) * 1000.0
 
+            sky_mask_start = time.perf_counter()
+            sky_mask = None
+            if bool(overlay_options.get("mask_foreground", True)):
+                sky_mask = compute_sky_mask(base_image)
+            sky_mask_ms = (time.perf_counter() - sky_mask_start) * 1000.0
+            if sky_mask is not None:
+                named_stars = filter_named_stars_by_sky_mask(named_stars, sky_mask)
+                visible_deep_sky_objects = filter_dsos_by_sky_mask(
+                    visible_deep_sky_objects, sky_mask
+                )
+                visible_constellations = filter_constellations_by_sky_mask(
+                    visible_constellations, sky_mask
+                )
+
             overlay_scene_start = time.perf_counter()
             overlay_scene = build_overlay_scene(
                 base_image.size,
@@ -160,6 +180,7 @@ def annotate_image(
                     "normalize": round(normalize_ms, 2),
                     "solve": round(solve_ms, 2),
                     "scene": round(scene_ms, 2),
+                    "sky_mask": round(sky_mask_ms, 2),
                     "overlay_scene": round(overlay_scene_ms, 2),
                     "render": round(render_ms, 2),
                     "total": round((time.perf_counter() - total_start) * 1000.0, 2),

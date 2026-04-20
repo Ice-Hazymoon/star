@@ -5,3 +5,6 @@ pillow
 requests
 skyfield
 sep
+torch
+torchvision
+transformers

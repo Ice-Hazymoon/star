@@ -26,6 +26,7 @@ export type OverlayOptions = {
   preset: "balanced" | "detailed" | "max";
   layers: OverlayLayers;
   detail: OverlayDetail;
+  mask_foreground: boolean;
 };
 
 export const DEFAULT_OVERLAY_OPTIONS: OverlayOptions = {
@@ -52,6 +53,7 @@ export const DEFAULT_OVERLAY_OPTIONS: OverlayOptions = {
     detailed_dso_labels: true,
     include_catalog_dsos: true,
   },
+  mask_foreground: true,
 };
 
 export const OVERLAY_PRESETS: Record<OverlayOptions["preset"], Pick<OverlayOptions, "detail">> = {
@@ -160,6 +162,8 @@ export function normalizeOverlayOptions(input: unknown): OverlayOptions {
   for (const key of Object.keys(options.layers) as Array<keyof OverlayLayers>) {
     options.layers[key] = Boolean(options.layers[key]);
   }
+
+  options.mask_foreground = options.mask_foreground !== false;
 
   return options;
 }

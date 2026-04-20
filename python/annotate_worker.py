@@ -8,7 +8,17 @@ from collections import OrderedDict
 from pathlib import Path
 from typing import Any
 
+# Silence HF Hub / transformers chatter before any transformers import — the
+# Bun server tags every line written to stderr as "worker stderr" and logs it
+# as an error, so the unauthenticated-access warning and tqdm progress bars
+# look like failures even though they are not.
+os.environ.setdefault("HF_HUB_DISABLE_PROGRESS_BARS", "1")
+os.environ.setdefault("HF_HUB_DISABLE_TELEMETRY", "1")
+os.environ.setdefault("TRANSFORMERS_VERBOSITY", "error")
+os.environ.setdefault("HF_HUB_VERBOSITY", "error")
+
 import annotate
+import annotate_sky_mask
 
 
 def parse_asset_cache_limit() -> int:
@@ -102,12 +112,14 @@ def process_job(payload: dict[str, Any]) -> dict[str, Any]:
     )
 
     if action == "preload":
+        sky_mask_ready = annotate_sky_mask.preload()
         return {
             "status": "ok",
             "catalog_rows": int(len(assets["catalog"])),
             "constellation_count": int(len(assets["constellations"])),
             "deep_sky_object_count": int(len(assets["deep_sky_objects"])),
             "star_name_count": int(len(assets["star_names"])),
+            "sky_mask_ready": bool(sky_mask_ready),
         }
 
     input_path = Path(payload["input_path"]).resolve()

@@ -30,6 +30,7 @@ DEFAULT_OVERLAY_OPTIONS = {
         "detailed_dso_labels": True,
         "include_catalog_dsos": True,
     },
+    "mask_foreground": True,
 }
 
 OVERLAY_PRESETS = {
@@ -144,4 +145,5 @@ def parse_overlay_options(raw_options: str) -> dict[str, Any]:
     detail["show_all_constellation_labels"] = bool(detail.get("show_all_constellation_labels"))
     detail["detailed_dso_labels"] = bool(detail.get("detailed_dso_labels"))
     detail["include_catalog_dsos"] = bool(detail.get("include_catalog_dsos"))
+    options["mask_foreground"] = bool(options.get("mask_foreground", True))
     return options
