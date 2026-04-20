@@ -6,6 +6,7 @@ describe("runtime config", () => {
     const config = getRuntimeConfig({});
     expect(config.port).toBe(3000);
     expect(config.maxRequestBodySizeBytes).toBeGreaterThan(config.maxUploadBytes);
+    expect(config.maxQueuedJobs).toBe(8);
     expect(config.corsAllowedOrigins).toBe("*");
   });
 
@@ -13,12 +14,14 @@ describe("runtime config", () => {
     const config = getRuntimeConfig({
       PORT: "99999",
       MAX_UPLOAD_BYTES: "1048576",
+      MAX_QUEUED_JOBS: "12",
       WORKER_JOB_TIMEOUT_MS: "6000",
       ALLOW_CLI_FALLBACK: "false",
     });
 
     expect(config.port).toBe(65_535);
     expect(config.maxUploadBytes).toBe(1_048_576);
+    expect(config.maxQueuedJobs).toBe(12);
     expect(config.workerJobTimeoutMs).toBe(6_000);
     expect(config.allowCliFallback).toBe(false);
   });

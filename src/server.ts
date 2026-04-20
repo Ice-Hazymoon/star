@@ -44,6 +44,11 @@ import {
   validateImageUpload,
   withCommonHeaders,
 } from "./server-utils";
+import {
+  createJobLimiter,
+  JobQueueAbortedError,
+  JobQueueFullError,
+} from "./job-limiter";
 
 type AnnotationWorkerRequest = {
   id: string;
@@ -77,11 +82,11 @@ type PendingWorkerRequest = {
 };
 
 const CONFIG = getRuntimeConfig();
+const jobLimiter = createJobLimiter(CONFIG.maxConcurrentJobs, CONFIG.maxQueuedJobs);
 
 const pendingWorkerRequests = new Map<string, PendingWorkerRequest>();
 let workerProcess: ReturnType<typeof Bun.spawn> | null = null;
 let workerReady = false;
-let activeJobs = 0;
 let shuttingDown = false;
 let workerWarmupPromise: Promise<void> | null = null;
 
@@ -556,16 +561,17 @@ async function validateRuntimePrerequisites() {
   runCommandCheck(["solve-field", "--help"], "solve-field");
 }
 
-async function withJobSlot<T>(callback: () => Promise<T>) {
-  if (activeJobs >= CONFIG.maxConcurrentJobs) {
-    throw new HttpError(429, "server is busy, retry later");
-  }
-
-  activeJobs += 1;
+async function withJobSlot<T>(callback: () => Promise<T>, abortSignal?: AbortSignal) {
   try {
-    return await callback();
-  } finally {
-    activeJobs -= 1;
+    return await jobLimiter.run(callback, abortSignal);
+  } catch (error) {
+    if (error instanceof JobQueueFullError) {
+      throw new HttpError(429, "server is busy, retry later");
+    }
+    if (error instanceof JobQueueAbortedError) {
+      throw createAbortError();
+    }
+    throw error;
   }
 }
 
@@ -824,7 +830,7 @@ async function handleAnalyzeUpload(request: Request) {
         locale,
         workspaceDir,
         abortSignal: request.signal,
-      }));
+      }), request.signal);
     });
     logInfo("upload completed", {
       requestId,
@@ -865,7 +871,7 @@ async function handleAnalyzeSample(request: Request) {
         locale,
         workspaceDir,
         abortSignal: request.signal,
-      })),
+      }), request.signal),
     );
     logInfo("sample completed", { requestId, sampleId: sample.id, processingMs: result.processingMs });
     return finalizeResponse(request, jsonResponse(result), requestId);
@@ -894,15 +900,18 @@ function serveStaticFile(request: Request, baseDir: string, relativePath: string
 }
 
 function healthPayload() {
+  const limiterStats = jobLimiter.stats();
   return {
     ok: true,
     uptimeMs: Math.round(process.uptime() * 1000),
-    activeJobs,
+    activeJobs: limiterStats.activeJobs,
+    queuedJobs: limiterStats.queuedJobs,
     workerReady,
     pendingWorkerRequests: pendingWorkerRequests.size,
     config: {
       maxUploadBytes: CONFIG.maxUploadBytes,
       maxConcurrentJobs: CONFIG.maxConcurrentJobs,
+      maxQueuedJobs: CONFIG.maxQueuedJobs,
       allowCliFallback: CONFIG.allowCliFallback,
     },
   };

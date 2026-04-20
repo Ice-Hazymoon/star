@@ -6,6 +6,7 @@ export type RuntimeConfig = {
   maxRequestBodySizeBytes: number;
   maxUploadBytes: number;
   maxConcurrentJobs: number;
+  maxQueuedJobs: number;
   workerJobTimeoutMs: number;
   allowCliFallback: boolean;
   preloadWorkerOnStartup: boolean;
@@ -77,6 +78,7 @@ export function getRuntimeConfig(env: Env = process.env): RuntimeConfig {
     maxRequestBodySizeBytes,
     maxUploadBytes,
     maxConcurrentJobs: parseInteger(env.MAX_CONCURRENT_JOBS, 1, 1, 32),
+    maxQueuedJobs: parseInteger(env.MAX_QUEUED_JOBS, 8, 0, 256),
     workerJobTimeoutMs: parseInteger(env.WORKER_JOB_TIMEOUT_MS, 120_000, 5_000, 15 * 60_000),
     allowCliFallback: parseBoolean(env.ALLOW_CLI_FALLBACK, true),
     preloadWorkerOnStartup: parseBoolean(env.PRELOAD_WORKER_ON_STARTUP, true),

@@ -219,11 +219,13 @@ Returns service health:
   "ok": true,
   "uptimeMs": 2142,
   "activeJobs": 0,
+  "queuedJobs": 0,
   "workerReady": true,
   "pendingWorkerRequests": 0,
   "config": {
     "maxUploadBytes": 26214400,
     "maxConcurrentJobs": 1,
+    "maxQueuedJobs": 8,
     "allowCliFallback": true
   }
 }
@@ -480,6 +482,7 @@ Example:
 | `PORT` | `3000` | HTTP port |
 | `MAX_UPLOAD_BYTES` | `26214400` | Maximum upload size |
 | `MAX_CONCURRENT_JOBS` | `1` | Maximum in-flight jobs |
+| `MAX_QUEUED_JOBS` | `8` | Maximum queued jobs waiting for a slot |
 | `WORKER_JOB_TIMEOUT_MS` | `120000` | Per-request timeout |
 | `ALLOW_CLI_FALLBACK` | `true` | Fall back to the CLI solver if the worker fails |
 | `PRELOAD_WORKER_ON_STARTUP` | `true` | Warm the Python worker on startup |

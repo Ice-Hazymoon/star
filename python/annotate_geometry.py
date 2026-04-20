@@ -87,6 +87,38 @@ def compute_field_metrics(wcs: WCS, crop: CropCandidate) -> dict[str, Any]:
     }
 
 
+def compute_field_center_and_radius(wcs: WCS, crop: CropCandidate) -> tuple[SkyCoord, float]:
+    width = crop.width
+    height = crop.height
+    sample_pixels = np.array(
+        [
+            (width / 2.0, height / 2.0),
+            (0.0, 0.0),
+            (width - 1.0, 0.0),
+            (0.0, height - 1.0),
+            (width - 1.0, height - 1.0),
+            (0.0, height / 2.0),
+            (width - 1.0, height / 2.0),
+            (width / 2.0, 0.0),
+            (width / 2.0, height - 1.0),
+        ],
+        dtype=np.float64,
+    )
+    ra_values, dec_values = wcs.all_pix2world(sample_pixels[:, 0], sample_pixels[:, 1], 0)
+    coords = SkyCoord(ra_values, dec_values, unit="deg")
+    center = coords[0]
+    edge_separations = center.separation(coords[1:]).deg
+    radius = float(np.nanmax(edge_separations)) if len(edge_separations) else 0.0
+    return center, radius
+
+
+def skycoord_separation_degrees(center: SkyCoord, ra_values: np.ndarray, dec_values: np.ndarray) -> np.ndarray:
+    if len(ra_values) == 0:
+        return np.asarray(ra_values, dtype=np.float64)
+    coords = SkyCoord(ra_values, dec_values, unit="deg")
+    return center.separation(coords).deg
+
+
 def compute_out_code(x: float, y: float, min_x: float, max_x: float, min_y: float, max_y: float) -> int:
     code = 0
     if x < min_x:

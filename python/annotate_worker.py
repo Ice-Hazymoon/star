@@ -2,13 +2,25 @@
 from __future__ import annotations
 
 import json
+import os
 import sys
+from collections import OrderedDict
 from pathlib import Path
 from typing import Any
 
 import annotate
 
-ASSET_CACHE: dict[tuple[str, ...], dict[str, Any]] = {}
+
+def parse_asset_cache_limit() -> int:
+    raw_value = os.environ.get("ANNOTATION_WORKER_ASSET_CACHE_SIZE", "4").strip()
+    try:
+        return max(1, min(16, int(raw_value)))
+    except ValueError:
+        return 4
+
+
+MAX_ASSET_CACHE_SIZE = parse_asset_cache_limit()
+ASSET_CACHE: OrderedDict[tuple[str, ...], dict[str, Any]] = OrderedDict()
 
 
 def load_assets(
@@ -31,6 +43,7 @@ def load_assets(
     )
     cached = ASSET_CACHE.get(cache_key)
     if cached is not None:
+        ASSET_CACHE.move_to_end(cache_key)
         return cached
 
     localization_bundle = annotate.load_localized_names(localization_paths, locale)
@@ -54,6 +67,9 @@ def load_assets(
         "localization": localization_bundle,
     }
     ASSET_CACHE[cache_key] = assets
+    ASSET_CACHE.move_to_end(cache_key)
+    while len(ASSET_CACHE) > MAX_ASSET_CACHE_SIZE:
+        ASSET_CACHE.popitem(last=False)
     return assets
 
 
