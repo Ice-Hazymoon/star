@@ -147,10 +147,17 @@ def annotate_image(
             # applying it to the scene. If the model hallucinated a horizon
             # (common on pure night-sky images with vignetting), too many
             # real stars land on "ground" pixels and we drop the mask.
-            if sky_mask is not None:
+            mask_requested = bool(overlay_options.get("mask_foreground", True))
+            mask_reason: str
+            if sky_mask is None:
+                mask_reason = "not_requested" if not mask_requested else "model_unavailable"
+            else:
                 star_positions = [(star["x"], star["y"]) for star in named_stars]
                 if not mask_is_trustworthy(sky_mask, star_positions):
                     sky_mask = None
+                    mask_reason = "untrustworthy"
+                else:
+                    mask_reason = "applied"
             if sky_mask is not None:
                 named_stars = filter_named_stars_by_sky_mask(named_stars, sky_mask)
                 visible_deep_sky_objects = filter_dsos_by_sky_mask(
@@ -196,6 +203,11 @@ def annotate_image(
                 "visible_constellations": visible_constellations,
                 "visible_deep_sky_objects": visible_deep_sky_objects,
                 "render_options": overlay_options,
+                "sky_mask_status": {
+                    "requested": mask_requested,
+                    "applied": sky_mask is not None,
+                    "reason": mask_reason,
+                },
                 "overlay_scene": overlay_scene,
                 "solver_log_tail": summarize_solver_output(solve_result.stdout, solve_result.stderr),
                 "timings_ms": {

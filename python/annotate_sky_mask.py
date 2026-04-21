@@ -57,8 +57,13 @@ RAW_SKY_THRESHOLD = 0.6
 PURE_SKY_MEDIAN_THRESHOLD = 25.0
 # Erode the sky mask (i.e. grow the ground region) by this many pixels at
 # small-scale before upsample, to give annotations a safety margin from the
-# mask boundary.
-SKY_SAFETY_MARGIN_PX = 12
+# mask boundary. Kept small because on images with complex silhouettes (trees
+# between sky), each 3×3 erosion pass eats both sides of narrow sky channels
+# — at iterations=12 the orion-over-pines sample drops from 35% → 15% sky,
+# which then fails mask_is_trustworthy (only 2/13 named stars land in sky)
+# and the whole mask gets discarded, meaning nothing gets filtered. With 6
+# iterations, 5/13 stars land in sky and the mask is applied correctly.
+SKY_SAFETY_MARGIN_PX = 6
 # 3×3 full (Chebyshev / 8-connectivity) structuring element — matches the
 # semantics of PIL's MinFilter(3) / MaxFilter(3).
 _STRUCT_3X3 = _ndi.generate_binary_structure(2, 2)

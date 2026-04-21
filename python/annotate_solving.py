@@ -571,7 +571,18 @@ def solve_image(
                 )
                 continue
 
-            for scale_low, scale_high in scale_windows:
+            # Once any crop has produced an accepted solve, we already know
+            # roughly what scale the image sits at — don't keep running the
+            # full (wide/medium/narrow) ladder on subsequent crops. The
+            # narrow-scale pass in particular burns ~10s (capped by cpulimit)
+            # on any wide-field image that doesn't match, which is pure waste
+            # once we have a WCS.
+            if accepted_results:
+                estimated = estimate_scale_window(accepted_results[0], crop)
+                crop_scale_windows = [estimated]
+            else:
+                crop_scale_windows = scale_windows
+            for scale_low, scale_high in crop_scale_windows:
                 if budget_exhausted():
                     break
                 _attempt_start = time.perf_counter()

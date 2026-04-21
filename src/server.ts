@@ -105,6 +105,18 @@ function logError(message: string, error?: unknown, metadata?: Record<string, un
   console.error(`[star-server] ${message}${Object.keys(payload).length ? ` ${JSON.stringify(payload)}` : ""}`);
 }
 
+// Pipeline failures that aren't going to be fixed by retrying via the CLI —
+// the CLI runs the exact same Python pipeline on the same input, so e.g. a
+// plate-solve timeout will recur and just double the client-visible latency.
+const DETERMINISTIC_PIPELINE_ERROR_PATTERNS = [
+  /plate solving aborted after/i,
+];
+
+function isDeterministicPipelineError(error: unknown): boolean {
+  const message = error instanceof Error ? error.message : typeof error === "string" ? error : "";
+  return DETERMINISTIC_PIPELINE_ERROR_PATTERNS.some((pattern) => pattern.test(message));
+}
+
 function parseOverlayOptionsFromFormData(formData: { get(name: string): string | File | null }) {
   const rawOptions = formData.get("options");
   if (rawOptions == null || rawOptions === "") {
@@ -792,7 +804,9 @@ async function runAnnotation(
       processingMs: Math.round(performance.now() - startedAt),
     } satisfies AnnotationApiResponse;
   } catch (error) {
-    if (!CONFIG.allowCliFallback || error instanceof HttpError) {
+    if (!CONFIG.allowCliFallback || error instanceof HttpError || isDeterministicPipelineError(error)) {
+      // Deterministic pipeline failures (e.g. plate-solve timeout) will reproduce
+      // in the CLI fallback — retrying just doubles the client-visible latency.
       throw error;
     }
     logError("worker fallback to CLI", error);
