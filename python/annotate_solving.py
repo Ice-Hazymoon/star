@@ -17,9 +17,19 @@ from PIL import Image
 # run 2-3× longer. Use these as wall-clock hard stops on each subprocess and a
 # total budget for the whole solve loop so an un-solvable image can't lock up
 # the worker indefinitely.
-XYLIST_SUBPROCESS_TIMEOUT_S = 90.0
-IMAGE_SUBPROCESS_TIMEOUT_S = 150.0
-SOLVE_TIME_BUDGET_S = 90.0
+#
+# Empirical distribution of per-attempt wall time (profiled on samples/):
+#   successful solve:                        200ms – 1.3s
+#   quick mismatch (wide/medium scale):      700ms – 2.1s
+#   pathological mismatch (narrow scale on   20s   – 60s
+#     a wide-field image — see orion):
+# We size wall timeouts to cut the pathological tail without threatening the
+# real-solve band; --cpulimit on solve-field produces a graceful early exit,
+# and the Python wall timeout is a safety net for the case where solve-field
+# doesn't honour its own limit quickly enough.
+XYLIST_SUBPROCESS_TIMEOUT_S = 15.0
+IMAGE_SUBPROCESS_TIMEOUT_S = 20.0
+SOLVE_TIME_BUDGET_S = 30.0
 
 
 class SolveTimeoutError(RuntimeError):
@@ -50,13 +60,21 @@ def verification_score(verification: dict[str, Any], crop: CropCandidate, image_
     alignment_mean = float(verification.get("alignment_mean_px", 30.0))
     alignment_p75 = float(verification.get("alignment_p75_px", 45.0))
     log_matches = math.log1p(max(match_count, 0.0))
+    # Saturate rms / max-px penalties: when a foreground-noisy full-image solve
+    # is competing against a small clean sub-crop, unbounded rms penalties let
+    # the sub-crop win even though the full-image WCS is geometrically correct.
+    # Past ~3 px rms and ~8 px max the fit is already "bad enough"; more
+    # penalty doesn't change what action we should take, it just sinks the
+    # full-image candidate below every sub-crop.
+    capped_rms = min(rms_px, 3.0)
+    capped_max = min(max_px, 8.0)
     return (
         log_matches * 32.0
         + spread * 40.0
         + area_ratio * 20.0
         + covered_quadrants * 4.0
-        - rms_px * 8.0
-        - max_px * 1.1
+        - capped_rms * 8.0
+        - capped_max * 1.1
         - alignment_mean * 1.2
         - alignment_p75 * 0.6
     )
@@ -127,7 +145,7 @@ def run_solve_on_xylist(
         "--index-dir",
         str(index_dir),
         "--cpulimit",
-        "45",
+        "10",
         "--scale-units",
         "degwidth",
         "--scale-low",
@@ -206,7 +224,7 @@ def run_solve_on_image(
         "--index-dir",
         str(index_dir),
         "--cpulimit",
-        "90",
+        "15",
         "--downsample",
         str(downsample),
         "--scale-units",
@@ -457,23 +475,40 @@ def is_strong_solution(result: SolveResult, image_width: int, image_height: int)
     area_ratio = (result.crop.width * result.crop.height) / max(image_width * image_height, 1)
     alignment_count = int(result.verification.get("alignment_count", 0))
     alignment_mean = float(result.verification.get("alignment_mean_px", 999.0))
+    match_count = int(result.verification.get("match_count", 0))
+    rms_px = float(result.verification.get("rms_px", 99.0))
+    max_px = float(result.verification.get("max_px", 99.0))
+    covered_quadrants = int(result.verification.get("covered_quadrants", 0))
     score = verification_score(result.verification, result.crop, image_width, image_height)
     return (
         (
             area_ratio >= 0.75
-            and int(result.verification.get("match_count", 0)) >= 45
-            and float(result.verification.get("rms_px", 99.0)) <= 3.0
-            and float(result.verification.get("max_px", 99.0)) <= 12.0
-            and int(result.verification.get("covered_quadrants", 0)) >= 4
+            and match_count >= 45
+            and rms_px <= 3.0
+            and max_px <= 12.0
+            and covered_quadrants >= 4
             and (alignment_count < 3 or alignment_mean <= 36.0)
         )
         or (
             score >= 100.0
-            and int(result.verification.get("match_count", 0)) >= 40
-            and float(result.verification.get("rms_px", 99.0)) <= 3.6
-            and float(result.verification.get("max_px", 99.0)) <= 10.0
-            and int(result.verification.get("covered_quadrants", 0)) >= 4
+            and match_count >= 40
+            and rms_px <= 3.6
+            and max_px <= 10.0
+            and covered_quadrants >= 4
             and (alignment_count < 3 or alignment_mean <= 24.0)
+        )
+        # Full-image early-exit: once astrometry.net accepts the full frame
+        # with decent match coverage, stop trying sub-crops even if their RMS
+        # might be cleaner. A clean sub-crop WCS solves a smaller region, so
+        # extrapolated object positions in the rest of the frame can drift;
+        # a solved full-image fit — even with foreground-inflated RMS — gives
+        # more trustworthy positions across the entire image.
+        or (
+            area_ratio >= 0.95
+            and match_count >= 30
+            and rms_px <= 8.0
+            and max_px <= 24.0
+            and covered_quadrants >= 4
         )
     )
 
@@ -493,9 +528,10 @@ def solve_image(
     index_dir: Path,
     catalog: pd.DataFrame,
     star_names: dict[int, str],
+    sky_mask: np.ndarray | None = None,
 ) -> tuple[SolveResult, list[dict[str, Any]], dict[str, Any]]:
     attempts: list[dict[str, Any]] = []
-    source_analysis = analyze_sources(image)
+    source_analysis = analyze_sources(image, sky_mask=sky_mask)
     accepted_results: list[SolveResult] = []
     scale_windows = [
         (20.0, 120.0),
@@ -538,6 +574,7 @@ def solve_image(
             for scale_low, scale_high in scale_windows:
                 if budget_exhausted():
                     break
+                _attempt_start = time.perf_counter()
                 result = run_solve_on_xylist(
                     xylist_path,
                     crop,
@@ -547,6 +584,7 @@ def solve_image(
                     index_dir,
                     max_wall_seconds=min(XYLIST_SUBPROCESS_TIMEOUT_S, remaining_budget()),
                 )
+                _attempt_ms = (time.perf_counter() - _attempt_start) * 1000.0
                 verification = verify_solution(result) if result else None
                 if result and verification and verification["accepted"]:
                     verification = enrich_solution_verification(
@@ -572,6 +610,7 @@ def solve_image(
                         "source_count": source_count,
                         "status": "solved" if result and verification and verification["accepted"] else ("rejected" if result else "failed"),
                         "verification": verification,
+                        "wall_ms": round(_attempt_ms, 1),
                     }
                 )
                 if result and verification and verification["accepted"]:
@@ -627,6 +666,7 @@ def solve_image(
             for downsample in (2, 4, 1):
                 if budget_exhausted():
                     break
+                _attempt_start = time.perf_counter()
                 result = run_solve_on_image(
                     crop_path,
                     crop,
@@ -637,6 +677,7 @@ def solve_image(
                     index_dir,
                     max_wall_seconds=min(IMAGE_SUBPROCESS_TIMEOUT_S, remaining_budget()),
                 )
+                _attempt_ms = (time.perf_counter() - _attempt_start) * 1000.0
                 verification = verify_solution(result) if result else None
                 if result and verification and verification["accepted"]:
                     verification = enrich_solution_verification(
@@ -661,6 +702,7 @@ def solve_image(
                         "scale_high_deg": scale_high,
                         "status": "solved" if result and verification and verification["accepted"] else ("rejected" if result else "failed"),
                         "verification": verification,
+                        "wall_ms": round(_attempt_ms, 1),
                     }
                 )
                 if result and verification and verification["accepted"]:

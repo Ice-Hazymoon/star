@@ -1,5 +1,8 @@
 astroquery
 astropy
+onnx
+onnxruntime
+onnxscript
 pandas
 pillow
 requests

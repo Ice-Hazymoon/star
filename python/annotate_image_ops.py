@@ -97,7 +97,21 @@ def score_source_candidate(flux: float, peak: float, major: float, minor: float,
     return clamp_float(score, 0.0, 1.0)
 
 
-def analyze_sources(image: Image.Image) -> SourceAnalysis:
+def analyze_sources(
+    image: Image.Image,
+    sky_mask: np.ndarray | None = None,
+) -> SourceAnalysis:
+    """Extract candidate star sources from the image.
+
+    `sky_mask`, when provided, is a (H, W) uint8 array with 1 = sky / 0 =
+    ground. sep detections whose centroid lands on ground pixels are dropped
+    before being fed to solve-field. This dramatically cleans up the source
+    list on foreground-heavy images (tree silhouettes, city skylines) and
+    keeps the full-image solve's RMS competitive with sub-crop solves. The
+    mask is applied "optimistically": if it accidentally filters too much
+    (bad mask → few detections left), we fall back to the unfiltered list so
+    solve still has something to work with.
+    """
     if sep is None:
         return SourceAnalysis(
             mode="fallback-no-sep",
@@ -165,6 +179,23 @@ def analyze_sources(image: Image.Image) -> SourceAnalysis:
         if star_score >= 0.22:
             usable_detections.append(detection)
 
+    mask_filtered_count = 0
+    if sky_mask is not None and sky_mask.size > 0 and usable_detections:
+        mask_h, mask_w = sky_mask.shape[:2]
+        kept: list[SourceDetection] = []
+        for detection in usable_detections:
+            xi = max(0, min(mask_w - 1, int(round(detection.x))))
+            yi = max(0, min(mask_h - 1, int(round(detection.y))))
+            if sky_mask[yi, xi]:
+                kept.append(detection)
+        # Only apply the mask if enough detections survive to keep solve
+        # viable — otherwise a bad (hallucinated) mask could starve the
+        # solver of real sources. 30 is a conservative floor; astrometry.net
+        # typically needs ~20 matches to lock in a solution.
+        if len(kept) >= 30 or len(kept) >= len(usable_detections) * 0.5:
+            mask_filtered_count = len(usable_detections) - len(kept)
+            usable_detections = kept
+
     tile_cols = max(4, min(12, round(image.width / 180)))
     tile_rows = max(4, min(12, round(image.height / 180)))
     tile_scores = np.zeros((tile_rows, tile_cols), dtype=np.float32)
@@ -226,6 +257,7 @@ def analyze_sources(image: Image.Image) -> SourceAnalysis:
             "mode": "sep",
             "raw_sources": len(raw_detections),
             "usable_sources": len(usable_detections),
+            "mask_filtered": mask_filtered_count,
             "threshold": threshold,
             "background_rms": float(background.globalrms),
             "tile_rows": tile_rows,

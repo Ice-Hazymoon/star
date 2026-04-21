@@ -45,13 +45,17 @@ RUN export http_proxy= HTTPS_PROXY= HTTP_PROXY= https_proxy= ALL_PROXY= all_prox
     && find /app/.venv -name '*.pyc' -delete \
     && find /app/.venv -name '__pycache__' -type d -prune -exec rm -rf '{}' +
 
-# Bake the sky-mask model into the image so the container doesn't pull ~490MB
-# from HuggingFace on first request. Fails the build if the model can't be
-# fetched, which is better than silently degrading at runtime.
+# Bake the sky-mask model into the image so the container doesn't pull it
+# from HuggingFace on first request, and export it to int8-quantized ONNX
+# (annotate_sky_mask.py loads this via onnxruntime at runtime, which is 2-3×
+# faster than the PyTorch path). Fails the build if either step breaks —
+# better than silently degrading at runtime.
 COPY python/annotate_sky_mask.py /tmp/annotate_sky_mask.py
+COPY python/export_sky_mask_onnx.py /tmp/export_sky_mask_onnx.py
 RUN export http_proxy= HTTPS_PROXY= HTTP_PROXY= https_proxy= ALL_PROXY= all_proxy= NO_PROXY= no_proxy= \
+    && python3 /tmp/export_sky_mask_onnx.py /app/hf_cache \
     && python3 -c "import sys; sys.path.insert(0, '/tmp'); import annotate_sky_mask as m; assert m.preload(), 'sky-mask model failed to load during build'" \
-    && rm /tmp/annotate_sky_mask.py \
+    && rm /tmp/annotate_sky_mask.py /tmp/export_sky_mask_onnx.py \
     && find /app/hf_cache -name '*.pyc' -delete 2>/dev/null || true
 
 FROM oven/bun:debian AS data-bootstrap

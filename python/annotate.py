@@ -84,8 +84,26 @@ def annotate_image(
             base_image, _ = normalize_image(input_path, workdir)
             normalize_ms = (time.perf_counter() - normalize_start) * 1000.0
 
+            # Sky mask runs *before* solve so it can clean ground-pixel
+            # detections out of sep's output — this keeps the full-image
+            # solve's RMS competitive with a clean sub-crop's, which in turn
+            # lets the full-image candidate win verification_score and avoid
+            # the truncated-render pathology on foreground-heavy images.
+            sky_mask_start = time.perf_counter()
+            sky_mask = None
+            if bool(overlay_options.get("mask_foreground", True)):
+                sky_mask = compute_sky_mask(base_image)
+            sky_mask_ms = (time.perf_counter() - sky_mask_start) * 1000.0
+
             solve_start = time.perf_counter()
-            solve_result, attempts, source_analysis = solve_image(base_image, workdir, index_dir, catalog, star_names)
+            solve_result, attempts, source_analysis = solve_image(
+                base_image,
+                workdir,
+                index_dir,
+                catalog,
+                star_names,
+                sky_mask=sky_mask,
+            )
             solve_ms = (time.perf_counter() - solve_start) * 1000.0
 
             scene_start = time.perf_counter()
@@ -125,15 +143,14 @@ def annotate_image(
             )
             scene_ms = (time.perf_counter() - scene_start) * 1000.0
 
-            sky_mask_start = time.perf_counter()
-            sky_mask = None
-            if bool(overlay_options.get("mask_foreground", True)):
-                sky_mask = compute_sky_mask(base_image)
-                if sky_mask is not None:
-                    star_positions = [(star["x"], star["y"]) for star in named_stars]
-                    if not mask_is_trustworthy(sky_mask, star_positions):
-                        sky_mask = None
-            sky_mask_ms = (time.perf_counter() - sky_mask_start) * 1000.0
+            # Validate the mask against plate-solved star positions before
+            # applying it to the scene. If the model hallucinated a horizon
+            # (common on pure night-sky images with vignetting), too many
+            # real stars land on "ground" pixels and we drop the mask.
+            if sky_mask is not None:
+                star_positions = [(star["x"], star["y"]) for star in named_stars]
+                if not mask_is_trustworthy(sky_mask, star_positions):
+                    sky_mask = None
             if sky_mask is not None:
                 named_stars = filter_named_stars_by_sky_mask(named_stars, sky_mask)
                 visible_deep_sky_objects = filter_dsos_by_sky_mask(

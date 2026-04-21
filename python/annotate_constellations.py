@@ -2,7 +2,6 @@
 from __future__ import annotations
 
 import json
-import math
 from pathlib import Path
 from typing import Any
 
@@ -36,7 +35,6 @@ def build_constellation_entry(
         "native_name": resolved_native_name,
         "display_name": display_name or resolved_native_name,
         "lines": [],
-        "coord_lines": [],
         "label_ra_degrees": None,
         "label_dec_degrees": None,
     }
@@ -53,10 +51,6 @@ def merge_constellation_entries(target: dict[str, Any], incoming: dict[str, Any]
     for polyline in incoming.get("lines", []):
         if len(polyline) >= 2:
             target["lines"].append([int(hip) for hip in polyline])
-
-    for polyline in incoming.get("coord_lines", []):
-        if len(polyline) >= 2:
-            target["coord_lines"].append(polyline)
 
     if target["label_ra_degrees"] is None and incoming.get("label_ra_degrees") is not None:
         target["label_ra_degrees"] = float(incoming["label_ra_degrees"])
@@ -89,47 +83,6 @@ def parse_proto_scalar(value_text: str) -> str | float | int:
         return int(value_text)
     except ValueError:
         return value_text
-
-
-def angular_distance_degrees(
-    ra_a: float,
-    dec_a: float,
-    ra_b: float,
-    dec_b: float,
-) -> float:
-    ra_a_rad = math.radians(ra_a)
-    dec_a_rad = math.radians(dec_a)
-    ra_b_rad = math.radians(ra_b)
-    dec_b_rad = math.radians(dec_b)
-    cosine = (
-        math.sin(dec_a_rad) * math.sin(dec_b_rad)
-        + math.cos(dec_a_rad) * math.cos(dec_b_rad) * math.cos(ra_a_rad - ra_b_rad)
-    )
-    return math.degrees(math.acos(max(-1.0, min(1.0, cosine))))
-
-
-def coord_lines_match_anchor(
-    coord_lines: list[list[dict[str, float]]],
-    label_ra_degrees: float | None,
-    label_dec_degrees: float | None,
-    max_distance_degrees: float = 45.0,
-) -> bool:
-    if label_ra_degrees is None or label_dec_degrees is None:
-        return True
-    closest_distance: float | None = None
-    for polyline in coord_lines:
-        for point in polyline:
-            distance = angular_distance_degrees(
-                label_ra_degrees,
-                label_dec_degrees,
-                float(point["ra_degrees"]),
-                float(point["dec_degrees"]),
-            )
-            if closest_distance is None or distance < closest_distance:
-                closest_distance = distance
-    if closest_distance is None:
-        return False
-    return closest_distance <= max_distance_degrees
 
 
 def parse_stardroid_constellations(constellation_path: Path) -> list[dict[str, Any]]:
@@ -190,26 +143,6 @@ def parse_stardroid_constellations(constellation_path: Path) -> list[dict[str, A
 
     parsed_sources: list[dict[str, Any]] = []
     for source in sources:
-        coord_lines: list[list[dict[str, float]]] = []
-        for raw_line in source.get("lines", []):
-            vertices: list[dict[str, float]] = []
-            for vertex in raw_line.get("vertices", []):
-                ra_value = vertex.get("right_ascension")
-                dec_value = vertex.get("declination")
-                if ra_value is None or dec_value is None:
-                    continue
-                vertices.append(
-                    {
-                        "ra_degrees": float(ra_value),
-                        "dec_degrees": float(dec_value),
-                    }
-                )
-            if len(vertices) >= 2:
-                coord_lines.append(vertices)
-
-        if not coord_lines:
-            continue
-
         label_block = next((label for label in source.get("labels", []) if label.get("strings_str_id")), None)
         if label_block is None:
             label_block = source.get("labels", [{}])[0] if source.get("labels") else {}
@@ -227,14 +160,11 @@ def parse_stardroid_constellations(constellation_path: Path) -> list[dict[str, A
 
         label_ra_degrees = float(location["right_ascension"]) if "right_ascension" in location else None
         label_dec_degrees = float(location["declination"]) if "declination" in location else None
-        if not coord_lines_match_anchor(coord_lines, label_ra_degrees, label_dec_degrees):
-            coord_lines = []
 
         parsed_sources.append(
             {
                 "name_key": raw_name_key,
                 "english_name": english_name.title(),
-                "coord_lines": coord_lines,
                 "label_ra_degrees": label_ra_degrees,
                 "label_dec_degrees": label_dec_degrees,
             }
@@ -299,7 +229,6 @@ def load_constellations(constellation_paths: list[Path], localized_names: dict[s
                 if existing
                 else resolve_constellation_display_name(resolved_abbr, english_name, english_name, localized_names),
             )
-            incoming["coord_lines"] = item["coord_lines"]
             incoming["label_ra_degrees"] = item["label_ra_degrees"]
             incoming["label_dec_degrees"] = item["label_dec_degrees"]
 

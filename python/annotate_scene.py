@@ -15,6 +15,7 @@ from PIL import Image, ImageDraw, ImageFont
 from annotate_geometry import (
     build_segment_key,
     clip_segment_to_bounds,
+    compute_display_field_center_and_radius,
     compute_field_center_and_radius,
     crop_bounds,
     is_point_inside_crop,
@@ -241,53 +242,6 @@ def clip_constellation_segment_to_crop(
     return clipped_segment
 
 
-def point_distance_outside_bounds(
-    x_value: float,
-    y_value: float,
-    min_x: float,
-    max_x: float,
-    min_y: float,
-    max_y: float,
-) -> float:
-    dx = 0.0
-    dy = 0.0
-    if x_value < min_x:
-        dx = min_x - x_value
-    elif x_value > max_x:
-        dx = x_value - max_x
-    if y_value < min_y:
-        dy = min_y - y_value
-    elif y_value > max_y:
-        dy = y_value - max_y
-    return math.hypot(dx, dy)
-
-
-def should_keep_supplemental_constellation_segment(
-    start_x: float,
-    start_y: float,
-    end_x: float,
-    end_y: float,
-    clipped_segment: tuple[float, float, float, float],
-    crop: CropCandidate,
-    image_width: int,
-    image_height: int,
-) -> bool:
-    if is_point_inside_crop(start_x, start_y, crop, margin=24.0) or is_point_inside_crop(end_x, end_y, crop, margin=24.0):
-        return True
-
-    min_x, max_x, min_y, max_y = crop_bounds(crop)
-    start_overshoot = point_distance_outside_bounds(start_x, start_y, min_x, max_x, min_y, max_y)
-    end_overshoot = point_distance_outside_bounds(end_x, end_y, min_x, max_x, min_y, max_y)
-    overshoot_limit = max(image_width, image_height) * 0.45
-    clipped_length_squared = point_distance_squared(*clipped_segment)
-    near_full_span_threshold = (min(image_width, image_height) * 0.9) ** 2
-
-    if max(start_overshoot, end_overshoot) > overshoot_limit and clipped_length_squared >= near_full_span_threshold:
-        return False
-
-    return True
-
-
 def constellation_segment_min_separation_degrees(
     field_center: Any,
     start_ra_degrees: float,
@@ -315,7 +269,12 @@ def collect_named_stars(
     candidate_hips = [hip for hip in star_names if hip in catalog.index]
     if not candidate_hips:
         return []
-    field_center, field_radius_degrees = compute_field_center_and_radius(wcs, crop)
+    # Guard radius covers the full image — when a sub-crop wins the solve we
+    # still want to surface objects anywhere in the visible frame, not just
+    # inside the solved rectangle.
+    field_center, field_radius_degrees = compute_display_field_center_and_radius(
+        wcs, crop, image_width, image_height
+    )
     star_guard_radius_degrees = field_radius_degrees + 6.0
 
     magnitude_limit = float(overlay_detail_value(overlay_options, "star_magnitude_limit"))
@@ -344,9 +303,7 @@ def collect_named_stars(
     for (hip, row), x_value, y_value in zip(subset.iterrows(), x_values, y_values, strict=True):
         if not (math.isfinite(x_value) and math.isfinite(y_value)):
             continue
-        if not is_point_visible(float(x_value), float(y_value), image_width, image_height):
-            continue
-        if not is_point_inside_crop(float(x_value), float(y_value), crop, margin=12.0):
+        if not is_point_visible(float(x_value), float(y_value), image_width, image_height, margin=12.0):
             continue
         visible.append(
             {
@@ -382,10 +339,73 @@ def collect_constellations(
 ) -> list[dict[str, Any]]:
     result: list[dict[str, Any]] = []
     duplicate_tolerance = max(6.0, min(image_width, image_height) / 180.0)
-    min_x, max_x, min_y, max_y = crop_bounds(crop)
-    field_center, field_radius_degrees = compute_field_center_and_radius(wcs, crop)
+    # `display_crop` spans the full image so visibility / clipping covers the
+    # whole frame even when a sub-crop won the solve. `crop` is kept as-is for
+    # project_points (where its x/y offset un-offsets the crop-local WCS).
+    display_crop = CropCandidate(
+        name="display", x=0, y=0, width=image_width, height=image_height
+    )
+    min_x, max_x, min_y, max_y = crop_bounds(display_crop)
+    field_center, field_radius_degrees = compute_display_field_center_and_radius(
+        wcs, crop, image_width, image_height
+    )
     segment_guard_radius_degrees = field_radius_degrees + 12.0
     label_guard_radius_degrees = field_radius_degrees + 8.0
+
+    # Every constellation segment endpoint is a HIP star in `catalog`. Project
+    # the whole catalog once with a single astropy call and build HIP-keyed
+    # lookup tables — the inner loops then do dict access instead of calling
+    # all_world2pix / SkyCoord.separation per segment.
+    catalog_hips = catalog.index.to_numpy()
+    catalog_ra = catalog["ra_degrees"].to_numpy()
+    catalog_dec = catalog["dec_degrees"].to_numpy()
+    catalog_xs, catalog_ys = project_points(wcs, catalog_ra, catalog_dec, crop)
+    catalog_seps = skycoord_separation_degrees(field_center, catalog_ra, catalog_dec)
+    catalog_ra_by_hip: dict[int, float] = {}
+    catalog_dec_by_hip: dict[int, float] = {}
+    catalog_xy_by_hip: dict[int, tuple[float, float]] = {}
+    catalog_sep_by_hip: dict[int, float] = {}
+    for hip, ra, dec, x, y, sep in zip(
+        catalog_hips.tolist(),
+        catalog_ra.tolist(),
+        catalog_dec.tolist(),
+        catalog_xs.tolist(),
+        catalog_ys.tolist(),
+        catalog_seps.tolist(),
+        strict=True,
+    ):
+        hip_int = int(hip)
+        catalog_ra_by_hip[hip_int] = float(ra)
+        catalog_dec_by_hip[hip_int] = float(dec)
+        catalog_xy_by_hip[hip_int] = (float(x), float(y))
+        catalog_sep_by_hip[hip_int] = float(sep)
+
+    # Batch-project the explicit label anchors across all constellations (most
+    # have label_ra/dec_degrees set). The recognition loop below only uses the
+    # lookup for constellations that actually make it to the label phase, so
+    # projecting the full set up front is cheaper than per-constellation calls.
+    label_abbrs: list[str] = []
+    label_ra_list: list[float] = []
+    label_dec_list: list[float] = []
+    for item in constellations:
+        if item.get("label_ra_degrees") is None or item.get("label_dec_degrees") is None:
+            continue
+        label_abbrs.append(item["abbr"])
+        label_ra_list.append(float(item["label_ra_degrees"]))
+        label_dec_list.append(float(item["label_dec_degrees"]))
+    label_xy_by_abbr: dict[str, tuple[float, float]] = {}
+    label_sep_by_abbr: dict[str, float] = {}
+    if label_abbrs:
+        lbl_ra = np.asarray(label_ra_list, dtype=np.float64)
+        lbl_dec = np.asarray(label_dec_list, dtype=np.float64)
+        lbl_seps = skycoord_separation_degrees(field_center, lbl_ra, lbl_dec)
+        lbl_xs, lbl_ys = project_points(wcs, lbl_ra, lbl_dec, crop)
+        for abbr, x, y, sep in zip(
+            label_abbrs, lbl_xs.tolist(), lbl_ys.tolist(), lbl_seps.tolist(), strict=True
+        ):
+            label_xy_by_abbr[abbr] = (float(x), float(y))
+            label_sep_by_abbr[abbr] = float(sep)
+
     for constellation in constellations:
         visible_segments: list[dict[str, Any]] = []
         label_points: list[tuple[float, float]] = []
@@ -395,29 +415,17 @@ def collect_constellations(
 
         for polyline in constellation.get("lines", []):
             for start_hip, end_hip in pairwise(polyline):
-                if start_hip not in catalog.index or end_hip not in catalog.index:
+                start_xy = catalog_xy_by_hip.get(start_hip)
+                end_xy = catalog_xy_by_hip.get(end_hip)
+                if start_xy is None or end_xy is None:
                     continue
-                start = catalog.loc[start_hip]
-                end = catalog.loc[end_hip]
-                if constellation_segment_min_separation_degrees(
-                    field_center,
-                    float(start["ra_degrees"]),
-                    float(start["dec_degrees"]),
-                    float(end["ra_degrees"]),
-                    float(end["dec_degrees"]),
-                ) > segment_guard_radius_degrees:
+                if min(catalog_sep_by_hip[start_hip], catalog_sep_by_hip[end_hip]) > segment_guard_radius_degrees:
                     continue
-                x_values, y_values = project_points(
-                    wcs,
-                    np.array([start["ra_degrees"], end["ra_degrees"]]),
-                    np.array([start["dec_degrees"], end["dec_degrees"]]),
-                    crop,
-                )
-                start_x, end_x = float(x_values[0]), float(x_values[1])
-                start_y, end_y = float(y_values[0]), float(y_values[1])
+                start_x, start_y = start_xy
+                end_x, end_y = end_xy
                 if not all(math.isfinite(value) for value in (start_x, start_y, end_x, end_y)):
                     continue
-                if not segment_intersects_crop(start_x, start_y, end_x, end_y, crop, margin=36.0):
+                if not segment_intersects_crop(start_x, start_y, end_x, end_y, display_crop, margin=36.0):
                     continue
                 recognized = True
                 break
@@ -425,77 +433,29 @@ def collect_constellations(
                 break
 
         if not recognized:
-            for polyline in constellation.get("coord_lines", []):
-                for start_point, end_point in pairwise(polyline):
-                    if constellation_segment_min_separation_degrees(
-                        field_center,
-                        float(start_point["ra_degrees"]),
-                        float(start_point["dec_degrees"]),
-                        float(end_point["ra_degrees"]),
-                        float(end_point["dec_degrees"]),
-                    ) > segment_guard_radius_degrees:
-                        continue
-                    x_values, y_values = project_points(
-                        wcs,
-                        np.array([start_point["ra_degrees"], end_point["ra_degrees"]]),
-                        np.array([start_point["dec_degrees"], end_point["dec_degrees"]]),
-                        crop,
-                    )
-                    start_x, end_x = float(x_values[0]), float(x_values[1])
-                    start_y, end_y = float(y_values[0]), float(y_values[1])
-                    if not all(math.isfinite(value) for value in (start_x, start_y, end_x, end_y)):
-                        continue
-                    if not segment_intersects_crop(start_x, start_y, end_x, end_y, crop, margin=36.0):
-                        continue
-                    clipped_segment = clip_constellation_segment_to_crop(start_x, start_y, end_x, end_y, crop)
-                    if clipped_segment is None:
-                        continue
-                    if not should_keep_supplemental_constellation_segment(
-                        start_x,
-                        start_y,
-                        end_x,
-                        end_y,
-                        clipped_segment,
-                        crop,
-                        image_width,
-                        image_height,
-                    ):
-                        continue
-                    recognized = True
-                    break
-                if recognized:
-                    break
-
-        if not recognized:
             continue
 
         for polyline in constellation.get("lines", []):
             for start_hip, end_hip in pairwise(polyline):
-                if start_hip not in catalog.index or end_hip not in catalog.index:
+                start_xy = catalog_xy_by_hip.get(start_hip)
+                end_xy = catalog_xy_by_hip.get(end_hip)
+                if start_xy is None or end_xy is None:
                     continue
-                start = catalog.loc[start_hip]
-                end = catalog.loc[end_hip]
                 segment_key = build_segment_key(
-                    float(start["ra_degrees"]),
-                    float(start["dec_degrees"]),
-                    float(end["ra_degrees"]),
-                    float(end["dec_degrees"]),
+                    catalog_ra_by_hip[start_hip],
+                    catalog_dec_by_hip[start_hip],
+                    catalog_ra_by_hip[end_hip],
+                    catalog_dec_by_hip[end_hip],
                 )
                 if segment_key in segment_keys:
                     continue
-                x_values, y_values = project_points(
-                    wcs,
-                    np.array([start["ra_degrees"], end["ra_degrees"]]),
-                    np.array([start["dec_degrees"], end["dec_degrees"]]),
-                    crop,
-                )
-                start_x, end_x = float(x_values[0]), float(x_values[1])
-                start_y, end_y = float(y_values[0]), float(y_values[1])
+                start_x, start_y = start_xy
+                end_x, end_y = end_xy
                 if not all(math.isfinite(value) for value in (start_x, start_y, end_x, end_y)):
                     continue
-                if not segment_intersects_crop(start_x, start_y, end_x, end_y, crop, margin=36.0):
+                if not segment_intersects_crop(start_x, start_y, end_x, end_y, display_crop, margin=36.0):
                     continue
-                clipped_segment = clip_constellation_segment_to_crop(start_x, start_y, end_x, end_y, crop)
+                clipped_segment = clip_constellation_segment_to_crop(start_x, start_y, end_x, end_y, display_crop)
                 if clipped_segment is None:
                     continue
                 clipped_start_x, clipped_start_y, clipped_end_x, clipped_end_y = clipped_segment
@@ -523,94 +483,17 @@ def collect_constellations(
                 label_points.append((clipped_start_x, clipped_start_y))
                 label_points.append((clipped_end_x, clipped_end_y))
 
-        for polyline in constellation.get("coord_lines", []):
-            ra_values = np.array([point["ra_degrees"] for point in polyline])
-            dec_values = np.array([point["dec_degrees"] for point in polyline])
-            x_values, y_values = project_points(wcs, ra_values, dec_values, crop)
-            projected_points = list(zip(polyline, x_values, y_values, strict=True))
-            for (start_point, start_x_raw, start_y_raw), (end_point, end_x_raw, end_y_raw) in pairwise(projected_points):
-                start_x = float(start_x_raw)
-                start_y = float(start_y_raw)
-                end_x = float(end_x_raw)
-                end_y = float(end_y_raw)
-                if not all(math.isfinite(value) for value in (start_x, start_y, end_x, end_y)):
-                    continue
-
-                segment_key = build_segment_key(
-                    float(start_point["ra_degrees"]),
-                    float(start_point["dec_degrees"]),
-                    float(end_point["ra_degrees"]),
-                    float(end_point["dec_degrees"]),
-                )
-                if segment_key in segment_keys:
-                    continue
-                endpoint_separations = skycoord_separation_degrees(
-                    field_center,
-                    np.array([float(start_point["ra_degrees"]), float(end_point["ra_degrees"])]),
-                    np.array([float(start_point["dec_degrees"]), float(end_point["dec_degrees"])]),
-                )
-                if float(np.min(endpoint_separations)) > segment_guard_radius_degrees:
-                    continue
-                if not segment_intersects_crop(start_x, start_y, end_x, end_y, crop, margin=36.0):
-                    continue
-                clipped_segment = clip_constellation_segment_to_crop(start_x, start_y, end_x, end_y, crop)
-                if clipped_segment is None:
-                    continue
-                if not should_keep_supplemental_constellation_segment(
-                    start_x,
-                    start_y,
-                    end_x,
-                    end_y,
-                    clipped_segment,
-                    crop,
-                    image_width,
-                    image_height,
-                ):
-                    continue
-                clipped_start_x, clipped_start_y, clipped_end_x, clipped_end_y = clipped_segment
-                if is_projected_segment_duplicate(
-                    visible_segments,
-                    clipped_start_x,
-                    clipped_start_y,
-                    clipped_end_x,
-                    clipped_end_y,
-                    duplicate_tolerance,
-                ):
-                    continue
-
-                segment_keys.add(segment_key)
-                onscreen_segments += 1
-
-                visible_segments.append(
-                    {
-                        "start": {"x": clipped_start_x, "y": clipped_start_y},
-                        "end": {"x": clipped_end_x, "y": clipped_end_y},
-                    }
-                )
-                label_points.append((clipped_start_x, clipped_start_y))
-                label_points.append((clipped_end_x, clipped_end_y))
-
         if not visible_segments:
             continue
         if len(label_points) < 2 and onscreen_segments == 0:
             continue
 
-        if constellation.get("label_ra_degrees") is not None and constellation.get("label_dec_degrees") is not None:
-            label_separation = skycoord_separation_degrees(
-                field_center,
-                np.array([float(constellation["label_ra_degrees"])]),
-                np.array([float(constellation["label_dec_degrees"])]),
-            )
-            label_x_values, label_y_values = project_points(
-                wcs,
-                np.array([constellation["label_ra_degrees"]]),
-                np.array([constellation["label_dec_degrees"]]),
-                crop,
-            )
-            explicit_label_x = float(label_x_values[0])
-            explicit_label_y = float(label_y_values[0])
+        label_xy = label_xy_by_abbr.get(constellation["abbr"])
+        if label_xy is not None:
+            explicit_label_x, explicit_label_y = label_xy
+            label_separation = label_sep_by_abbr[constellation["abbr"]]
             if (
-                float(label_separation[0]) <= label_guard_radius_degrees
+                label_separation <= label_guard_radius_degrees
                 and math.isfinite(explicit_label_x)
                 and math.isfinite(explicit_label_y)
                 and is_point_visible(
@@ -621,7 +504,7 @@ def collect_constellations(
                 margin=48.0,
                 )
             ):
-                if is_point_inside_crop(explicit_label_x, explicit_label_y, crop, margin=48.0):
+                if is_point_inside_crop(explicit_label_x, explicit_label_y, display_crop, margin=48.0):
                     label_x = explicit_label_x
                     label_y = explicit_label_y
                 elif label_points:
@@ -742,45 +625,64 @@ def collect_deep_sky_objects(
     dso_label_limit = int(overlay_detail_value(overlay_options, "dso_label_limit"))
     dso_spacing_scale = float(overlay_detail_value(overlay_options, "dso_spacing_scale"))
     detailed_labels = bool(overlay_detail_value(overlay_options, "detailed_dso_labels"))
-    field_center, field_radius_degrees = compute_field_center_and_radius(wcs, crop)
+    field_center, field_radius_degrees = compute_display_field_center_and_radius(
+        wcs, crop, image_width, image_height
+    )
     dso_guard_radius_degrees = field_radius_degrees + 6.0
 
-    candidates: list[dict[str, Any]] = []
+    # Phase 1 — cheap Python prefilter (same predicates as before, just lifted
+    # out of the per-object astropy loop).
+    prefiltered: list[dict[str, Any]] = []
     for item in deep_sky_objects:
         if not is_interesting_dso(item, overlay_options):
             continue
         if item["magnitude"] is not None and item["magnitude"] > dso_magnitude_limit and not item["messier"] and not item["common_name"]:
             continue
-        separation = skycoord_separation_degrees(
-            field_center,
-            np.array([float(item["ra_degrees"])]),
-            np.array([float(item["dec_degrees"])]),
+        prefiltered.append(item)
+
+    candidates: list[dict[str, Any]] = []
+    if prefiltered:
+        # Phase 2 — batch separation check against the field center.
+        pre_ra = np.fromiter(
+            (float(item["ra_degrees"]) for item in prefiltered),
+            dtype=np.float64,
+            count=len(prefiltered),
         )
-        if float(separation[0]) > dso_guard_radius_degrees:
-            continue
-        x_values, y_values = project_points(
-            wcs,
-            np.array([item["ra_degrees"]]),
-            np.array([item["dec_degrees"]]),
-            crop,
+        pre_dec = np.fromiter(
+            (float(item["dec_degrees"]) for item in prefiltered),
+            dtype=np.float64,
+            count=len(prefiltered),
         )
-        x_value = float(x_values[0])
-        y_value = float(y_values[0])
-        if not (math.isfinite(x_value) and math.isfinite(y_value)):
-            continue
-        if not is_point_visible(x_value, y_value, image_width, image_height, margin=28.0):
-            continue
-        if not is_point_inside_crop(x_value, y_value, crop, margin=28.0):
-            continue
-        candidate = dict(item)
-        candidate.update(
-            {
-                "x": x_value,
-                "y": y_value,
-                "display_label": compose_dso_display_label(item) if detailed_labels else (item.get("label") or item.get("name") or ""),
-            }
-        )
-        candidates.append(candidate)
+        separations = skycoord_separation_degrees(field_center, pre_ra, pre_dec)
+        within_guard = separations <= dso_guard_radius_degrees
+
+        shortlist_ra = pre_ra[within_guard]
+        shortlist_dec = pre_dec[within_guard]
+        shortlist_items = [
+            prefiltered[i] for i in range(len(prefiltered)) if within_guard[i]
+        ]
+
+        if shortlist_items:
+            # Phase 3 — one astropy all_world2pix call for everything that made it.
+            xs, ys = project_points(wcs, shortlist_ra, shortlist_dec, crop)
+
+            # Phase 4 — per-item finite + visibility filter; cheap Python.
+            for item, x_raw, y_raw in zip(shortlist_items, xs, ys, strict=True):
+                x_value = float(x_raw)
+                y_value = float(y_raw)
+                if not (math.isfinite(x_value) and math.isfinite(y_value)):
+                    continue
+                if not is_point_visible(x_value, y_value, image_width, image_height, margin=28.0):
+                    continue
+                candidate = dict(item)
+                candidate.update(
+                    {
+                        "x": x_value,
+                        "y": y_value,
+                        "display_label": compose_dso_display_label(item) if detailed_labels else (item.get("label") or item.get("name") or ""),
+                    }
+                )
+                candidates.append(candidate)
 
     selected: list[dict[str, Any]] = []
     anchors: list[tuple[float, float]] = []

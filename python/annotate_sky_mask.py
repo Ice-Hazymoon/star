@@ -17,13 +17,18 @@ so the expensive SegFormer pass usually runs exactly once per image. If the
 raw path disagrees with the heuristic (model predicts little sky on what was
 assumed to be pure sky) we fall back to a second pass on the tonemapped image.
 
-If torch/transformers aren't importable, the helpers gracefully no-op.
+Runtime: the model is loaded as an int8-quantized ONNX graph via onnxruntime
+(built once at Docker build time by export_sky_mask_onnx.py). If the ONNX
+file is missing (local dev), we fall back to loading the PyTorch model.
+
+If torch/transformers and onnxruntime all fail, the helpers gracefully no-op.
 """
 from __future__ import annotations
 
 import logging
 import os
 import warnings
+from pathlib import Path
 from typing import Any
 
 # Env vars consulted by huggingface_hub / transformers during import — set
@@ -40,76 +45,138 @@ from scipy import ndimage as _ndi
 
 MODEL_ID = "nvidia/segformer-b4-finetuned-ade-512-512"
 SKY_CLASS_INDEX = 2  # ADE20K `sky`
-# Inference size. Reduced from 512 → 384; sky segmentation is tolerant to this
-# downscale, and SegFormer's attention cost is roughly quadratic in patch count
-# (~44% less compute at 384 vs 512).
-INFERENCE_SIZE = 384
+# Inference size. The model was finetuned on 512×512 ADE20K crops and loses
+# a lot of accuracy at smaller input sizes — e.g. tonemap sky ratio on the
+# orion-over-pines sample goes from 44% @ 512 to 0% @ 384. Keep at 512. The
+# int8-quantized ONNX graph is fixed to this size too; changing it requires
+# re-exporting via python/export_sky_mask_onnx.py.
+INFERENCE_SIZE = 512
 RAW_SKY_THRESHOLD = 0.6
 # Below this median brightness on the downsampled image, we assume pure sky
 # and take the raw-inference fast path. Anything above tonemaps directly.
 PURE_SKY_MEDIAN_THRESHOLD = 25.0
 # Erode the sky mask (i.e. grow the ground region) by this many pixels at
 # small-scale before upsample, to give annotations a safety margin from the
-# mask boundary. Scaled to match INFERENCE_SIZE so the source-scale margin is
-# roughly constant (9/384 ≈ 12/512).
-SKY_SAFETY_MARGIN_PX = 9
+# mask boundary.
+SKY_SAFETY_MARGIN_PX = 12
 # 3×3 full (Chebyshev / 8-connectivity) structuring element — matches the
 # semantics of PIL's MinFilter(3) / MaxFilter(3).
 _STRUCT_3X3 = _ndi.generate_binary_structure(2, 2)
 
+ONNX_MODEL_FILENAME = "sky_mask_int8.onnx"
+# Search order: explicit env var, then the Docker HF cache, then a local
+# ./hf_cache for dev. export_sky_mask_onnx.py writes here during build.
+_ONNX_SEARCH_PATHS = [
+    os.environ.get("SKY_MASK_ONNX_PATH"),
+    str(Path(os.environ.get("HF_HOME", "/app/hf_cache")) / ONNX_MODEL_FILENAME),
+    str(Path(__file__).resolve().parent.parent / "hf_cache" / ONNX_MODEL_FILENAME),
+]
+
 _logger = logging.getLogger(__name__)
 _load_attempted = False
-_model: Any = None
+_model: Any = None      # torch fallback
+_session: Any = None    # onnxruntime InferenceSession (preferred)
 _processor: Any = None
 
 
-def _load_model() -> tuple[Any, Any] | None:
-    global _load_attempted, _model, _processor
-    if _model is not None and _processor is not None:
-        return _model, _processor
-    if _load_attempted:
+def _find_onnx_model() -> Path | None:
+    for candidate in _ONNX_SEARCH_PATHS:
+        if not candidate:
+            continue
+        path = Path(candidate)
+        if path.is_file():
+            return path
+    return None
+
+
+def _load_processor() -> Any:
+    from transformers import AutoImageProcessor
+    from transformers.utils import logging as transformers_logging
+
+    transformers_logging.set_verbosity_error()
+    try:
+        from huggingface_hub import logging as hub_logging
+
+        hub_logging.set_verbosity_error()
+    except Exception:  # noqa: BLE001 - logging is optional
+        pass
+
+    processor = AutoImageProcessor.from_pretrained(MODEL_ID)
+    # Override the processor's default 512×512 resize. This matches the fixed
+    # input size of the exported ONNX graph.
+    try:
+        processor.size = {"height": INFERENCE_SIZE, "width": INFERENCE_SIZE}
+    except Exception:  # noqa: BLE001 - older processor API variants
+        pass
+    return processor
+
+
+def _try_load_onnx(processor: Any) -> Any | None:
+    onnx_path = _find_onnx_model()
+    if onnx_path is None:
+        _logger.info("sky-mask ONNX file not found; using PyTorch fallback")
         return None
+    try:
+        import onnxruntime as ort
+
+        sess_opts = ort.SessionOptions()
+        sess_opts.graph_optimization_level = ort.GraphOptimizationLevel.ORT_ENABLE_ALL
+        session = ort.InferenceSession(
+            str(onnx_path),
+            sess_options=sess_opts,
+            providers=["CPUExecutionProvider"],
+        )
+        _logger.info("sky-mask model loaded via ONNX: %s", onnx_path)
+        return session
+    except Exception as exc:  # noqa: BLE001 - fall through to PyTorch
+        _logger.warning(
+            "failed to load ONNX sky-mask model (%s); using PyTorch fallback", exc
+        )
+        return None
+
+
+def _try_load_torch() -> Any | None:
+    try:
+        from transformers import SegformerForSemanticSegmentation
+
+        model = SegformerForSemanticSegmentation.from_pretrained(MODEL_ID)
+        model.eval()
+        _logger.info("sky-mask model loaded via PyTorch: %s", MODEL_ID)
+        return model
+    except Exception as exc:  # noqa: BLE001 - graceful degradation
+        _logger.warning("sky-mask torch model unavailable (%s)", exc)
+        return None
+
+
+def _load_model() -> bool:
+    """Populate the module-level model + processor. Returns True on success."""
+    global _load_attempted, _model, _session, _processor
+    if _processor is not None and (_session is not None or _model is not None):
+        return True
+    if _load_attempted:
+        return False
     _load_attempted = True
     try:
-        from transformers import AutoImageProcessor, SegformerForSemanticSegmentation
-        from transformers.utils import logging as transformers_logging
+        _processor = _load_processor()
+    except Exception as exc:  # noqa: BLE001
+        _logger.warning("sky-mask processor unavailable (%s); masking disabled", exc)
+        return False
 
-        transformers_logging.set_verbosity_error()
-        try:
-            from huggingface_hub import logging as hub_logging
+    _session = _try_load_onnx(_processor)
+    if _session is not None:
+        return True
+    _model = _try_load_torch()
+    if _model is not None:
+        return True
 
-            hub_logging.set_verbosity_error()
-        except Exception:  # noqa: BLE001 - logging is optional
-            pass
-
-        _processor = AutoImageProcessor.from_pretrained(MODEL_ID)
-        # Override the processor's default 512×512 resize. SegFormer is fully
-        # convolutional so it runs fine at any size, and this is where the
-        # actual inference-size reduction happens — our own _downsample below
-        # is only a memory optimization before the processor sees the image.
-        try:
-            _processor.size = {"height": INFERENCE_SIZE, "width": INFERENCE_SIZE}
-        except Exception:  # noqa: BLE001 - older processor API variants
-            pass
-        _model = SegformerForSemanticSegmentation.from_pretrained(MODEL_ID)
-        _model.eval()
-        _logger.info(
-            "sky-mask model loaded: %s at %dx%d",
-            MODEL_ID,
-            INFERENCE_SIZE,
-            INFERENCE_SIZE,
-        )
-        return _model, _processor
-    except Exception as exc:  # noqa: BLE001 - graceful degradation
-        _logger.warning("sky-mask model unavailable (%s); masking disabled", exc)
-        _model = None
-        _processor = None
-        return None
+    _logger.warning("sky-mask model unavailable; masking disabled")
+    _processor = None
+    return False
 
 
 def preload() -> bool:
     """Explicit warmup hook. Returns True when the model is ready."""
-    return _load_model() is not None
+    return _load_model()
 
 
 def _tonemap(rgb: np.ndarray) -> Image.Image:
@@ -127,23 +194,39 @@ def _downsample(image: Image.Image) -> Image.Image:
     scale = INFERENCE_SIZE / max(w, h)
     if scale >= 1.0:
         return rgb
-    return rgb.resize((max(1, int(w * scale)), max(1, int(h * scale))), Image.BILINEAR)
+    # LANCZOS here is load-bearing for accuracy: on images with fine
+    # foreground detail (e.g. tree silhouettes against a star field) BILINEAR
+    # blurs enough to confuse the model — tonemap sky ratio on
+    # orion-over-pines collapses from 33% (LANCZOS) to 4% (BILINEAR).
+    return rgb.resize((max(1, int(w * scale)), max(1, int(h * scale))), Image.LANCZOS)
+
+
+def _infer_logits(pixel_values: np.ndarray) -> np.ndarray:
+    """Run the segformer forward pass. Accepts preprocessor output (float32,
+    NCHW) and returns logits (float32, shape [1, num_classes, H/4, W/4])."""
+    if _session is not None:
+        return _session.run(["logits"], {"pixel_values": pixel_values})[0]
+    import torch
+
+    with torch.no_grad():
+        outputs = _model(pixel_values=torch.from_numpy(pixel_values))
+    return outputs.logits.cpu().numpy()
 
 
 def _run_segformer(img: Image.Image) -> np.ndarray:
-    import torch
-
-    inputs = _processor(images=img, return_tensors="pt")
-    with torch.no_grad():
-        outputs = _model(**inputs)
-    upsampled = torch.nn.functional.interpolate(
-        outputs.logits,
-        size=(img.height, img.width),
-        mode="bilinear",
-        align_corners=False,
+    inputs = _processor(images=img, return_tensors="np")
+    pixel_values = inputs["pixel_values"].astype(np.float32)
+    logits = _infer_logits(pixel_values)
+    # Argmax at the logits' native resolution (typically 96×96 for 384 input);
+    # the final resize to source size happens in _cleanup_and_resize, so an
+    # intermediate upsample-then-argmax would only add cost without affecting
+    # the final mask quality after the safety-margin erosion.
+    pred_small = np.argmax(logits[0], axis=0)
+    sky_small = ((pred_small == SKY_CLASS_INDEX).astype(np.uint8) * 255)
+    mask = Image.fromarray(sky_small, "L").resize(
+        (img.width, img.height), Image.BILINEAR
     )
-    pred = upsampled.argmax(dim=1).squeeze(0).cpu().numpy()
-    return (pred == SKY_CLASS_INDEX).astype(np.uint8)
+    return (np.asarray(mask, dtype=np.uint8) >= 128).astype(np.uint8)
 
 
 def _drop_floating_ground_blobs(sky_mask: np.ndarray) -> np.ndarray:
@@ -195,7 +278,7 @@ def compute_sky_mask(image: Image.Image) -> np.ndarray | None:
     Returns None if the underlying model couldn't load — callers should then
     skip masking rather than fail.
     """
-    if _load_model() is None:
+    if not _load_model():
         return None
 
     small = _downsample(image)

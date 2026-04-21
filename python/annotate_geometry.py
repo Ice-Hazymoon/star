@@ -112,6 +112,45 @@ def compute_field_center_and_radius(wcs: WCS, crop: CropCandidate) -> tuple[SkyC
     return center, radius
 
 
+def compute_display_field_center_and_radius(
+    wcs: WCS,
+    solve_crop: CropCandidate,
+    image_width: int,
+    image_height: int,
+) -> tuple[SkyCoord, float]:
+    """Angular field center + radius covering the **full image**, given a WCS
+    that was solved in `solve_crop`-local pixel coordinates. Used by scene
+    collection to set the catalog guard radius — without this, when a sub-crop
+    wins, objects in the uncropped portion of the image get filtered out by
+    angular distance even though their pixel positions would be valid."""
+    x_offset = float(solve_crop.x)
+    y_offset = float(solve_crop.y)
+    # Full-image pixel corners, expressed in solve-crop-local coords so the
+    # crop-local WCS can project them directly.
+    w = float(image_width)
+    h = float(image_height)
+    sample_pixels = np.array(
+        [
+            (w / 2.0 - x_offset, h / 2.0 - y_offset),
+            (0.0 - x_offset, 0.0 - y_offset),
+            (w - 1.0 - x_offset, 0.0 - y_offset),
+            (0.0 - x_offset, h - 1.0 - y_offset),
+            (w - 1.0 - x_offset, h - 1.0 - y_offset),
+            (0.0 - x_offset, h / 2.0 - y_offset),
+            (w - 1.0 - x_offset, h / 2.0 - y_offset),
+            (w / 2.0 - x_offset, 0.0 - y_offset),
+            (w / 2.0 - x_offset, h - 1.0 - y_offset),
+        ],
+        dtype=np.float64,
+    )
+    ra_values, dec_values = wcs.all_pix2world(sample_pixels[:, 0], sample_pixels[:, 1], 0)
+    coords = SkyCoord(ra_values, dec_values, unit="deg")
+    center = coords[0]
+    edge_separations = center.separation(coords[1:]).deg
+    radius = float(np.nanmax(edge_separations)) if len(edge_separations) else 0.0
+    return center, radius
+
+
 def skycoord_separation_degrees(center: SkyCoord, ra_values: np.ndarray, dec_values: np.ndarray) -> np.ndarray:
     if len(ra_values) == 0:
         return np.asarray(ra_values, dtype=np.float64)

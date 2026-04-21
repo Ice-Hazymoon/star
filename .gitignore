@@ -2,6 +2,7 @@
 node_modules/
 vendor/
 data/astrometry/
+hf_cache/
 inputs/
 outputs/
 tmp/
