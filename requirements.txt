@@ -3,6 +3,7 @@ astropy
 pandas
 pillow
 requests
+scipy
 skyfield
 sep
 torch

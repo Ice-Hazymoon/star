@@ -4,14 +4,18 @@ Sky/foreground segmentation used to suppress annotations that would otherwise
 be drawn on top of terrestrial features (sand, buildings, trees, people).
 
 Model: SegFormer-b4 fine-tuned on ADE20K. The ADE20K `sky` class (index 2) is
-used directly; two preprocessing variants are tried:
+used directly. Two preprocessing variants exist:
 
 - *raw* works for images that are nearly all sky (ADE20K has plenty of
   star-field-like training images).
 - *tonemap* (percentile stretch + gamma 0.45) is needed when there's a real
   foreground, because the model has no direct exposure to night scenes.
 
-An adaptive rule picks between the two based on the raw sky ratio.
+We pick between them up front from the downsampled image's median brightness
+— pure night skies are extremely dark, foreground-containing shots are not —
+so the expensive SegFormer pass usually runs exactly once per image. If the
+raw path disagrees with the heuristic (model predicts little sky on what was
+assumed to be pure sky) we fall back to a second pass on the tonemapped image.
 
 If torch/transformers aren't importable, the helpers gracefully no-op.
 """
@@ -31,18 +35,27 @@ os.environ.setdefault("HF_HUB_VERBOSITY", "error")
 warnings.filterwarnings("ignore", module=r"huggingface_hub.*")
 
 import numpy as np
-from PIL import Image, ImageDraw, ImageFilter
+from PIL import Image
+from scipy import ndimage as _ndi
 
 MODEL_ID = "nvidia/segformer-b4-finetuned-ade-512-512"
 SKY_CLASS_INDEX = 2  # ADE20K `sky`
-INFERENCE_SIZE = 512
+# Inference size. Reduced from 512 → 384; sky segmentation is tolerant to this
+# downscale, and SegFormer's attention cost is roughly quadratic in patch count
+# (~44% less compute at 384 vs 512).
+INFERENCE_SIZE = 384
 RAW_SKY_THRESHOLD = 0.6
+# Below this median brightness on the downsampled image, we assume pure sky
+# and take the raw-inference fast path. Anything above tonemaps directly.
+PURE_SKY_MEDIAN_THRESHOLD = 25.0
 # Erode the sky mask (i.e. grow the ground region) by this many pixels at
 # small-scale before upsample, to give annotations a safety margin from the
-# mask boundary. At 512-scale, 12px ≈ 36-50px in a typical source image —
-# enough that a star+label sitting on the horizon isn't painted into the
-# foreground even when the segmentation boundary is slightly off.
-SKY_SAFETY_MARGIN_PX = 12
+# mask boundary. Scaled to match INFERENCE_SIZE so the source-scale margin is
+# roughly constant (9/384 ≈ 12/512).
+SKY_SAFETY_MARGIN_PX = 9
+# 3×3 full (Chebyshev / 8-connectivity) structuring element — matches the
+# semantics of PIL's MinFilter(3) / MaxFilter(3).
+_STRUCT_3X3 = _ndi.generate_binary_structure(2, 2)
 
 _logger = logging.getLogger(__name__)
 _load_attempted = False
@@ -70,9 +83,22 @@ def _load_model() -> tuple[Any, Any] | None:
             pass
 
         _processor = AutoImageProcessor.from_pretrained(MODEL_ID)
+        # Override the processor's default 512×512 resize. SegFormer is fully
+        # convolutional so it runs fine at any size, and this is where the
+        # actual inference-size reduction happens — our own _downsample below
+        # is only a memory optimization before the processor sees the image.
+        try:
+            _processor.size = {"height": INFERENCE_SIZE, "width": INFERENCE_SIZE}
+        except Exception:  # noqa: BLE001 - older processor API variants
+            pass
         _model = SegformerForSemanticSegmentation.from_pretrained(MODEL_ID)
         _model.eval()
-        _logger.info("sky-mask model loaded: %s", MODEL_ID)
+        _logger.info(
+            "sky-mask model loaded: %s at %dx%d",
+            MODEL_ID,
+            INFERENCE_SIZE,
+            INFERENCE_SIZE,
+        )
         return _model, _processor
     except Exception as exc:  # noqa: BLE001 - graceful degradation
         _logger.warning("sky-mask model unavailable (%s); masking disabled", exc)
@@ -101,7 +127,7 @@ def _downsample(image: Image.Image) -> Image.Image:
     scale = INFERENCE_SIZE / max(w, h)
     if scale >= 1.0:
         return rgb
-    return rgb.resize((max(1, int(w * scale)), max(1, int(h * scale))), Image.LANCZOS)
+    return rgb.resize((max(1, int(w * scale)), max(1, int(h * scale))), Image.BILINEAR)
 
 
 def _run_segformer(img: Image.Image) -> np.ndarray:
@@ -125,37 +151,40 @@ def _drop_floating_ground_blobs(sky_mask: np.ndarray) -> np.ndarray:
     A ground blob floating inside the sky (not connected to any image border) is
     almost always a misclassification — bright Milky Way cores, compact star
     clusters, a lone satellite trail, etc. Real foreground touches the frame.
-    Flood-fill from a ground-painted frame around the image and flip any blob
-    the flood didn't reach back to sky.
+    Label every ground component and keep only the ones touching the frame.
     """
-    height, width = sky_mask.shape
-    ground = ((1 - sky_mask) * 255).astype(np.uint8)
-
-    padded = Image.new("L", (width + 2, height + 2), 255)
-    padded.paste(Image.fromarray(ground, "L"), (1, 1))
-    ImageDraw.floodfill(padded, (0, 0), 128)
-
-    reached = (np.asarray(padded)[1:-1, 1:-1] == 128).astype(np.uint8)
-    floating = ((ground > 0) & (reached == 0)).astype(np.uint8)
-    return (sky_mask | floating).astype(np.uint8)
+    ground = sky_mask == 0
+    labels, num = _ndi.label(ground, structure=_STRUCT_3X3)
+    if num == 0:
+        return sky_mask.copy()
+    border = np.concatenate(
+        [labels[0, :], labels[-1, :], labels[:, 0], labels[:, -1]]
+    )
+    border_labels = np.unique(border[border != 0])
+    keep = np.zeros(num + 1, dtype=bool)
+    keep[border_labels] = True
+    result = sky_mask.copy()
+    result[ground & ~keep[labels]] = 1
+    return result
 
 
 def _cleanup_and_resize(small_mask: np.ndarray, target_size: tuple[int, int]) -> np.ndarray:
-    mask_img = Image.fromarray((small_mask * 255).astype(np.uint8), "L")
+    mask_bool = small_mask.astype(bool)
     # Morphological closing at small scale: fill holes in sky introduced by
-    # misclassified bright regions (stars, Milky Way cores).
-    mask_img = mask_img.filter(ImageFilter.MaxFilter(size=5))
-    mask_img = mask_img.filter(ImageFilter.MinFilter(size=5))
-    cleaned = (np.asarray(mask_img, dtype=np.uint8) >= 128).astype(np.uint8)
-    cleaned = _drop_floating_ground_blobs(cleaned)
-
+    # misclassified bright regions (stars, Milky Way cores). 3×3 full structure
+    # × 2 iterations ≈ PIL MaxFilter(5) + MinFilter(5).
+    closed = _ndi.binary_closing(mask_bool, structure=_STRUCT_3X3, iterations=2)
+    cleaned = _drop_floating_ground_blobs(closed.astype(np.uint8))
     # Safety margin: erode sky so annotations near the horizon don't hug the
-    # boundary. MinFilter(3) erodes 1px per pass.
-    safety_img = Image.fromarray((cleaned * 255).astype(np.uint8), "L")
-    for _ in range(max(0, SKY_SAFETY_MARGIN_PX)):
-        safety_img = safety_img.filter(ImageFilter.MinFilter(3))
-
-    full = safety_img.resize(target_size, Image.BILINEAR)
+    # boundary.
+    eroded = _ndi.binary_erosion(
+        cleaned.astype(bool),
+        structure=_STRUCT_3X3,
+        iterations=max(0, SKY_SAFETY_MARGIN_PX),
+    )
+    full = Image.fromarray((eroded.astype(np.uint8) * 255), "L").resize(
+        target_size, Image.BILINEAR
+    )
     return (np.asarray(full, dtype=np.uint8) >= 128).astype(np.uint8)
 
 
@@ -172,10 +201,19 @@ def compute_sky_mask(image: Image.Image) -> np.ndarray | None:
     small = _downsample(image)
     rgb_small = np.asarray(small, dtype=np.uint8)
 
-    raw_mask = _run_segformer(small)
-    raw_ratio = float(raw_mask.mean())
-    if raw_ratio >= RAW_SKY_THRESHOLD:
-        chosen = raw_mask
+    # Pick the preprocessing up front from image statistics so we only run the
+    # expensive SegFormer pass once. A very dark median means "almost certainly
+    # pure night sky" → raw works. Anything brighter has foreground and needs
+    # tonemap to get a usable mask from the ADE20K model.
+    gray = rgb_small.mean(axis=-1) if rgb_small.ndim == 3 else rgb_small
+    median_brightness = float(np.median(gray))
+
+    if median_brightness < PURE_SKY_MEDIAN_THRESHOLD:
+        chosen = _run_segformer(small)
+        # Pre-check was wrong (model says mostly ground on a "dark" image).
+        # Retry once with tonemap; this is the only case that runs two passes.
+        if chosen.mean() < RAW_SKY_THRESHOLD:
+            chosen = _run_segformer(_tonemap(rgb_small))
     else:
         chosen = _run_segformer(_tonemap(rgb_small))
 
